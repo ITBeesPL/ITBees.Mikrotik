@@ -5,6 +5,10 @@ VisualStudioVersion = 17.12.35527.113 d17.12
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ITBees.Mikrotik", "ITBees.Mikrotik\ITBees.Mikrotik.csproj", "{97AFA412-51FA-46B7-A7A9-7B4F6E9198C1}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ITBees.Mikrotik.Tests", "ITBees.Mikrotik.Tests\ITBees.Mikrotik.Tests.csproj", "{08DD9876-E6AB-4743-8A26-AD450C6EF87D}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ITBees.Mikrotik.Cli", "ITBees.Mikrotik.Cli\ITBees.Mikrotik.Cli.csproj", "{5FDD0A00-7655-44D7-B82F-5499E8574544}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -15,6 +19,14 @@ Global
 		{97AFA412-51FA-46B7-A7A9-7B4F6E9198C1}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{97AFA412-51FA-46B7-A7A9-7B4F6E9198C1}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{97AFA412-51FA-46B7-A7A9-7B4F6E9198C1}.Release|Any CPU.Build.0 = Release|Any CPU
+		{08DD9876-E6AB-4743-8A26-AD450C6EF87D}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{08DD9876-E6AB-4743-8A26-AD450C6EF87D}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{08DD9876-E6AB-4743-8A26-AD450C6EF87D}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{08DD9876-E6AB-4743-8A26-AD450C6EF87D}.Release|Any CPU.Build.0 = Release|Any CPU
+		{5FDD0A00-7655-44D7-B82F-5499E8574544}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{5FDD0A00-7655-44D7-B82F-5499E8574544}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{5FDD0A00-7655-44D7-B82F-5499E8574544}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{5FDD0A00-7655-44D7-B82F-5499E8574544}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

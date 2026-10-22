@@ -5,6 +5,29 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
+    <PackageId>ITBees.Mikrotik</PackageId>
+    <Version>8.0.1</Version>
+    <Authors>ITBees</Authors>
+    <Description>Provisioning library for MikroTik routers used on Octopark parking sites (RB960PGS hEX PoE + Huawei E3372 LTE modem). MNDP discovery (like Winbox, independent of IP addressing), RouterOS API client (TCP 8728/8729, IPv4 and IPv6 link-local), login scan across discovered devices, idempotent configuration packages: password, identity, WAN DHCP, LAN bridge + DHCP server, LTE backup uplink with automatic failover/failback (recursive routes), WireGuard VPN to a central hub with watchdog, firewall hardening and status reading.</Description>
+    <PackageTags>mikrotik;routeros;mndp;wireguard;failover;lte;itbees;octopark</PackageTags>
+    <RepositoryType>git</RepositoryType>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <GenerateDocumentationFile>True</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="ITBees.Mikrotik.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="8.0.2" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.2" />
+  </ItemGroup>
 
 </Project>

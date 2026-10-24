@@ -177,6 +177,13 @@ public static class MikrotikConfigurationValidator
         }
         if (lan.Dhcp.LeaseTimeHours is < 1 or > 24 * 30)
             errors.Add("Lan.Dhcp.LeaseTimeHours must be between 1 and 720.");
+        if (lan.Mode == LanMode.SharedSiteNetwork)
+        {
+            if (lan.Dhcp.Enabled)
+                errors.Add("Lan.Dhcp.Enabled must be false in SharedSiteNetwork mode: the site network has its own DHCP server and a second one would hand out addresses to the site's devices. Give the parking devices static addresses instead.");
+            if (lan.Dhcp.StaticLeases.Count > 0)
+                warnings.Add("Lan.Dhcp.StaticLeases are ignored in SharedSiteNetwork mode (no DHCP server): set the addresses on the devices themselves.");
+        }
 
         var macs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var ips = new HashSet<string>(StringComparer.Ordinal);

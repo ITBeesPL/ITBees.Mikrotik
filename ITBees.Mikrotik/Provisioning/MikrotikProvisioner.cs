@@ -52,6 +52,7 @@ internal sealed class ProvisioningRun
     private const string WanList = "WAN";
     private const string LanList = "LAN";
     private const string VpnList = "VPN";
+    private const string LanAddressComment = "itbees:lan";
 
     private readonly IMikrotikClient _client;
     private readonly MikrotikConfigurationPackage _package;
@@ -84,6 +85,9 @@ internal sealed class ProvisioningRun
     private string Bridge => _package.Lan.BridgeName;
 
     private string Lte => _package.Lte.Interface;
+
+    /// <summary>Parking devices share the site network on the WAN port (see <see cref="LanMode.SharedSiteNetwork"/>).</summary>
+    private bool Shared => _package.Lan.Mode == LanMode.SharedSiteNetwork;
 
     public async Task ExecuteAsync(CancellationToken cancellationToken)
     {
@@ -175,14 +179,17 @@ internal sealed class ProvisioningRun
         {
             Warn($"Could not tell which router interface this session uses ({_sessionAddress?.ToString() ?? "unknown"}); make sure it is a LAN port or the VPN.");
         }
-        else if ((_managementInterface == Wan || (_package.Lte.Enabled && _managementInterface == Lte)) && !_options.AllowManagementOverWan)
+        else if (((_managementInterface == Wan && !Shared) || (_package.Lte.Enabled && _managementInterface == Lte)) && !_options.AllowManagementOverWan)
         {
+            // In SharedSiteNetwork mode the parking devices (and the column applying the package) live on the WAN
+            // port's network, and the managed firewall keeps it open for the parking subnet.
             throw Fail($"This session reaches the router through {_managementInterface} (WAN/LTE), which the managed firewall closes. Connect the computer to a LAN port (ether2-ether5) or use the VPN.");
         }
+        // In SharedSiteNetwork mode the bridge loses every IPv4 address, so a session on a LAN port always ends.
         _sessionViaLanIpv4 = _sessionAddress?.AddressFamily == AddressFamily.InterNetwork
                              && _managementInterface != null
                              && (_managementInterface == Bridge || _package.Lan.Ports.Contains(_managementInterface))
-                             && !_sessionAddress.Equals(_resolved.Lan.Address);
+                             && (Shared || !_sessionAddress.Equals(_resolved.Lan.Address));
 
         var lease = (await _writer.PrintAsync("/ip/dhcp-client", ct, ("interface", Wan)).ConfigureAwait(false)).FirstOrDefault();
         CheckWanOverlap(lease);
@@ -352,7 +359,8 @@ internal sealed class ProvisioningRun
         {
             foreach (var row in await _writer.PrintAsync("/ip/address", ct, ("interface", Wan)).ConfigureAwait(false))
             {
-                if (row.IsDynamic)
+                // In SharedSiteNetwork mode the LAN address lives on the WAN port; the LAN address step owns it.
+                if (row.IsDynamic || (Shared && row.Comment == LanAddressComment))
                     continue;
                 if (_sessionAddress != null && Ipv4Prefix.TryParse(row.Get("address"), out var p) && p.Address.Equals(_sessionAddress))
                 {
@@ -613,6 +621,9 @@ internal sealed class ProvisioningRun
             ("itbees:fw4-in-loopback", Rule("input", "accept", ("dst-address", "127.0.0.1"))),
             ("itbees:fw4-in-lan", Rule("input", "accept", ("in-interface-list", LanList))),
         };
+        // SharedSiteNetwork: the parking subnet arrives on the WAN port; the rest of the site network stays outside.
+        if (Shared)
+            rules.Add(("itbees:fw4-in-site-lan", Rule("input", "accept", ("in-interface", Wan), ("src-address", _resolved.LanCidr))));
         if (vpn.Enabled)
         {
             // Lets the hub re-initiate the tunnel after an uplink change; WireGuard ignores unauthenticated packets.
@@ -625,10 +636,22 @@ internal sealed class ProvisioningRun
         rules.Add(("itbees:fw4-fw-established", Rule("forward", "accept", ("connection-state", "established,related,untracked"))));
         rules.Add(("itbees:fw4-fw-invalid", Rule("forward", "drop", ("connection-state", "invalid"))));
         rules.Add(("itbees:fw4-fw-lan-wan", Rule("forward", "accept", ("in-interface-list", LanList), ("out-interface-list", WanList))));
+        if (Shared)
+            rules.Add(("itbees:fw4-fw-site-lan-wan", Rule("forward", "accept", ("in-interface", Wan), ("src-address", _resolved.LanCidr), ("out-interface-list", WanList))));
         if (vpn.Enabled && vpn.AllowAccessToLan)
+        {
             rules.Add(("itbees:fw4-fw-vpn-lan", Rule("forward", "accept", ("in-interface-list", VpnList), ("out-interface-list", LanList))));
+            // Leaves through the WAN port, so the masquerade rule also hides the VPN client behind the router's
+            // LAN address: devices answer on-link even with a wrong or missing gateway.
+            if (Shared)
+                rules.Add(("itbees:fw4-fw-vpn-site-lan", Rule("forward", "accept", ("in-interface-list", VpnList), ("out-interface", Wan), ("dst-address", _resolved.LanCidr))));
+        }
         if (vpn.Enabled && vpn.AllowLanToVpn)
+        {
             rules.Add(("itbees:fw4-fw-lan-vpn", Rule("forward", "accept", ("in-interface-list", LanList), ("out-interface-list", VpnList))));
+            if (Shared)
+                rules.Add(("itbees:fw4-fw-site-lan-vpn", Rule("forward", "accept", ("in-interface", Wan), ("src-address", _resolved.LanCidr), ("out-interface-list", VpnList))));
+        }
         rules.Add(("itbees:fw4-fw-dstnat", Rule("forward", "accept", ("connection-nat-state", "dstnat"))));
         rules.Add(("itbees:fw4-fw-drop", Rule("forward", "drop")));
         return rules;
@@ -770,6 +793,12 @@ internal sealed class ProvisioningRun
             await TrySingletonAsync("/tool/mac-server/mac-winbox", new Props { { "allowed-interface-list", LanList } }, "MAC-Winbox only on LAN", ct).ConfigureAwait(false);
         }
         await TrySingletonAsync("/tool/bandwidth-server", new Props { { "enabled", "no" } }, "bandwidth test server off", ct).ConfigureAwait(false);
+
+        // SharedSiteNetwork: traffic enters and leaves through the same port, so RouterOS would send ICMP redirects
+        // pointing the parking devices at the site router. Linux hosts (columns) accept them and would then bypass
+        // the router: no LTE failover and no VPN access.
+        if (Shared)
+            await TrySingletonAsync("/ip/settings", new Props { { "send-redirects", "no" } }, "no ICMP redirects (parking devices must keep the router as gateway)", ct).ConfigureAwait(false);
         return default;
     }
 
@@ -957,11 +986,20 @@ internal sealed class ProvisioningRun
         var routerIp = _resolved.LanRouterIp;
         var servers = (await _writer.PrintAsync("/ip/dhcp-server", ct, ("interface", Bridge)).ConfigureAwait(false)).Where(r => !r.IsDynamic).ToList();
 
+        if (Shared)
+        {
+            // A DHCP server on the WAN port would answer the site's own devices; none may run there.
+            servers.AddRange((await _writer.PrintAsync("/ip/dhcp-server", ct, ("interface", Wan)).ConfigureAwait(false)).Where(r => !r.IsDynamic));
+        }
+
         if (!dhcp.Enabled)
         {
             foreach (var server in servers.Where(s => !s.IsDisabled))
                 await _writer.SetAsync("/ip/dhcp-server", server.Id!, new Props { { "disabled", "yes" } }, $"disable DHCP server {server.Get("name")}", ct).ConfigureAwait(false);
-            return new StepOutcome("DHCP server disabled in the package", Skipped: servers.Count == 0);
+            await EnsureRouterDnsNameAsync(routerIp, ct).ConfigureAwait(false);
+            return Shared
+                ? new StepOutcome($"no DHCP server (shared site network): parking devices use static addresses in {_resolved.LanCidr} with gateway {routerIp}")
+                : new StepOutcome("DHCP server disabled in the package", Skipped: servers.Count == 0);
         }
 
         const string poolName = "itbees-lan";
@@ -1014,18 +1052,22 @@ internal sealed class ProvisioningRun
                 await _writer.RemoveAsync("/ip/pool", pool.Id!, "factory pool default-dhcp (unused)", ct).ConfigureAwait(false);
         }
 
-        if (_package.Lan.RouterDnsName != null)
-        {
-            await _writer.EnsureAsync(
-                    "/ip/dns/static",
-                    new[] { ("name", _package.Lan.RouterDnsName) },
-                    new Props { { "name", _package.Lan.RouterDnsName }, { "address", routerIp } },
-                    $"DNS name {_package.Lan.RouterDnsName} -> {routerIp}",
-                    ct,
-                    addOnly: new Props { { "comment", "itbees:router-name" } })
-                .ConfigureAwait(false);
-        }
+        await EnsureRouterDnsNameAsync(routerIp, ct).ConfigureAwait(false);
         return new StepOutcome($"{_resolved.LanCidr}, pool {_resolved.PoolRange}, {dhcp.StaticLeases.Count} static lease(s)");
+    }
+
+    private async Task EnsureRouterDnsNameAsync(string routerIp, CancellationToken ct)
+    {
+        if (_package.Lan.RouterDnsName == null)
+            return;
+        await _writer.EnsureAsync(
+                "/ip/dns/static",
+                new[] { ("name", _package.Lan.RouterDnsName) },
+                new Props { { "name", _package.Lan.RouterDnsName }, { "address", routerIp } },
+                $"DNS name {_package.Lan.RouterDnsName} -> {routerIp}",
+                ct,
+                addOnly: new Props { { "comment", "itbees:router-name" } })
+            .ConfigureAwait(false);
     }
 
     private async Task EnsureStaticLeasesAsync(string serverName, CancellationToken ct)
@@ -1089,9 +1131,11 @@ internal sealed class ProvisioningRun
 
     private async Task<StepOutcome> LanAddressAsync(CancellationToken ct)
     {
-        const string comment = "itbees:lan";
+        const string comment = LanAddressComment;
         var desired = _package.Lan.Address;
         _result.LanRouterAddress = _resolved.LanRouterIp;
+        if (Shared)
+            return await SharedLanAddressAsync(ct).ConfigureAwait(false);
         var rows = (await _writer.PrintAsync("/ip/address", ct, ("interface", Bridge)).ConfigureAwait(false)).Where(r => !r.IsDynamic).ToList();
         var exact = rows.FirstOrDefault(r => r.Get("address") == desired);
         var sessionRow = _sessionAddress == null
@@ -1137,10 +1181,52 @@ internal sealed class ProvisioningRun
         return new StepOutcome(_result.ReconnectRequired ? $"router now at {_resolved.LanRouterIp}; reconnect" : $"router at {_resolved.LanRouterIp}");
     }
 
-    /// <summary>Runs the command that removes this session's address: the reply usually never arrives.</summary>
-    private async Task FinalCommandAsync(Func<CancellationToken, Task> command, CancellationToken ct)
+    /// <summary>
+    /// SharedSiteNetwork: the LAN address goes on the WAN port, next to the site DHCP lease. The bridge (service
+    /// ports) keeps no IPv4 address, so the same subnet never sits on two interfaces and a factory 192.168.88.1
+    /// cannot clash with a site network that uses the MikroTik default subnet. This session's address goes last.
+    /// </summary>
+    private async Task<StepOutcome> SharedLanAddressAsync(CancellationToken ct)
     {
-        if (_writer.DryRun || !_sessionViaLanIpv4)
+        var desired = _package.Lan.Address;
+        bool IsSession(RouterOsRecord row) =>
+            _sessionAddress != null && Ipv4Prefix.TryParse(row.Get("address"), out var p) && p.Address.Equals(_sessionAddress);
+
+        var bridgeRows = (await _writer.PrintAsync("/ip/address", ct, ("interface", Bridge)).ConfigureAwait(false)).Where(r => !r.IsDynamic).ToList();
+        var sessionBridgeRow = bridgeRows.FirstOrDefault(IsSession);
+        foreach (var row in bridgeRows.Where(r => r != sessionBridgeRow))
+            await _writer.RemoveAsync("/ip/address", row.Id!, $"address {row.Get("address")} from {Bridge} (the parking subnet is on {Wan})", ct).ConfigureAwait(false);
+
+        var wanRows = (await _writer.PrintAsync("/ip/address", ct, ("interface", Wan)).ConfigureAwait(false)).Where(r => !r.IsDynamic).ToList();
+        var exact = wanRows.FirstOrDefault(r => r.Get("address") == desired);
+        if (exact == null)
+            await _writer.AddAsync("/ip/address", new Props { { "address", desired }, { "interface", Wan }, { "comment", LanAddressComment } }, $"LAN address {desired} on {Wan}", ct).ConfigureAwait(false);
+        else if (exact.Comment != LanAddressComment)
+            await _writer.SetAsync("/ip/address", exact.Id!, new Props { { "comment", LanAddressComment } }, $"mark LAN address {desired} on {Wan}", ct).ConfigureAwait(false);
+
+        // Old LAN addresses on the WAN port (e.g. after a change of the parking subnet).
+        var oldRows = wanRows.Where(r => r != exact && r.Comment == LanAddressComment).ToList();
+        foreach (var row in oldRows.Where(r => !IsSession(r)))
+            await _writer.RemoveAsync("/ip/address", row.Id!, $"old LAN address {row.Get("address")} from {Wan}", ct).ConfigureAwait(false);
+
+        var sessionRow = sessionBridgeRow ?? oldRows.FirstOrDefault(IsSession);
+        if (sessionRow != null)
+        {
+            await FinalCommandAsync(
+                    token => _writer.RemoveAsync("/ip/address", sessionRow.Id!, $"address {sessionRow.Get("address")} from {sessionRow.Get("interface")} (this session's address)", token),
+                    ct,
+                    cutsSession: true)
+                .ConfigureAwait(false);
+        }
+        return new StepOutcome(_result.ReconnectRequired
+            ? $"router now at {_resolved.LanRouterIp} on {Wan}; reconnect from the site network"
+            : $"router at {_resolved.LanRouterIp} on {Wan}");
+    }
+
+    /// <summary>Runs the command that removes this session's address: the reply usually never arrives.</summary>
+    private async Task FinalCommandAsync(Func<CancellationToken, Task> command, CancellationToken ct, bool? cutsSession = null)
+    {
+        if (_writer.DryRun || !(cutsSession ?? _sessionViaLanIpv4))
         {
             await command(ct).ConfigureAwait(false);
             return;
@@ -1161,7 +1247,9 @@ internal sealed class ProvisioningRun
             _logger.LogInformation("Session closed after re-addressing the LAN (expected): {Message}", e.Message);
         }
         _result.ReconnectRequired = true;
-        Warn($"The LAN address changed to {_resolved.LanRouterIp} and this session used the old one. Renew the computer's DHCP lease (or use the IPv6 link-local / VPN address) and reconnect to verify.");
+        Warn(Shared
+            ? $"The router is now at {_resolved.LanRouterIp} on {Wan} (shared site network) and this session used an address it no longer has. Connect the computer back to the site network with a static address in {_resolved.LanCidr} (gateway {_resolved.LanRouterIp}) and reconnect to verify."
+            : $"The LAN address changed to {_resolved.LanRouterIp} and this session used the old one. Renew the computer's DHCP lease (or use the IPv6 link-local / VPN address) and reconnect to verify.");
     }
 
     private void Warn(string message)

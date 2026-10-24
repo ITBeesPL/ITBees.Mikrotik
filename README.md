@@ -136,6 +136,48 @@ AllowedIPs = 10.250.0.12/32, 10.64.12.0/24
 `result.VpnHubPeer.ToWgSetCommand()` (`wg set wg0 peer ... allowed-ips ...`). Hub może też być MikroTikiem (CHR) —
 `ToRouterOsCommand()`.
 
+## Wspólna sieć obiektu (jeden kabel, bez izolacji)
+
+Gdy sieć obiektu nie pozwala przepiąć urządzeń parkingu „za” router (wszystko wisi na switchach klienta, a router
+dostaje jeden kabel), pakiet ustawia się w tryb `Lan.Mode = SharedSiteNetwork`:
+
+```
+internet ── router klienta (DHCP 192.168.1.x) ──┬── switche obiektu ──┬── urządzenia klienta (DHCP klienta)
+                                               │                     └── słupki, kamery, terminale parkingu:
+                                       ether1 MikroTika                  stałe adresy 192.168.23.x,
+                                       (DHCP 192.168.1.57 + 192.168.23.1/24)  brama 192.168.23.1
+                                               │
+                                       LTE (USB) = zapas, WireGuard do huba
+```
+
+Na jednym kablu działają dwie podsieci: sieć klienta (jego DHCP, przez nią router wychodzi do internetu) i podsieć
+parkingu (`Lan.Address`). Urządzenia parkingu mają **stałe adresy** z podsieci parkingu i router jako bramę, więc ich
+ruch idzie przez router: do internetu przez router klienta, a gdy ten internet padnie — przez LTE. Urządzenia klienta
+niczego nie zauważą.
+
+Co pakiet robi inaczej niż w trybie `OwnPorts`:
+- adres LAN routera trafia na **ether1** (obok adresu z DHCP klienta); mostek ether2–ether5 + sfp1 zostaje bez
+  adresu IPv4 jako porty serwisowe (dostępne przez IPv6 link-local),
+- **żadnego serwera DHCP** (`Lan.Dhcp.Enabled` musi być `false`, walidator to sprawdza) — odpowiadałby urządzeniom
+  klienta; `Lan.Dhcp.StaticLeases` są ignorowane (adresy ustawia się na urządzeniach),
+- firewall wpuszcza z ether1 (do routera, do internetu/LTE i do VPN) **tylko podsieć parkingu**; reszta sieci klienta
+  zostaje na zewnątrz,
+- ruch z VPN do urządzeń wychodzi przez ether1, więc maskarada podstawia adres routera — urządzenia odpowiadają
+  w swojej podsieci nawet ze źle ustawioną bramą,
+- `/ip settings send-redirects=no`: ruch wchodzi i wychodzi tym samym portem, a przekierowania ICMP kazałyby
+  urządzeniom (Linux je przyjmuje) iść prosto do routera klienta — z pominięciem failoveru i VPN,
+- sesja przez ether1 nie jest odrzucana w preflight (w tym trybie słupek wdrażający pakiet siedzi w sieci obiektu).
+
+Ograniczenia: urządzenie, które umie tylko DHCP, dostanie bramę od routera klienta i będzie działać bez zapasowego LTE
+i bez dostępu przez VPN. Izolacji nie ma — z sieci klienta da się dojść do urządzeń parkingu (jeśli ktoś doda trasę).
+Podsieć parkingu nie może pokrywać się z siecią klienta (preflight to sprawdza).
+
+**Pierwsze wdrożenie fabrycznego routera:** fabrycznie RouterOS wpuszcza logowanie i discovery tylko od strony
+ether2–ether5, a jego serwer DHCP (192.168.88.x) **nie może trafić do sieci klienta**. Dlatego na czas pierwszego
+wdrożenia: ether1 do sieci obiektu, komputer/słupek wdrażający kablem **bezpośrednio do ether2** (nie przez switch
+obiektu). Po wdrożeniu mostek traci adres 192.168.88.1 (sesja się kończy — `ReconnectRequired`), a słupek wraca do
+sieci obiektu i od tej pory łączy się z routerem adresem z podsieci parkingu na ether1.
+
 ## Discovery „jak Winbox” i połączenie bez wspólnej podsieci
 
 `DiscoverAsync()` wysyła zapytanie **MNDP** (UDP 5678) na broadcast i multicast IPv6 `ff02::1` na każdej karcie
@@ -281,6 +323,9 @@ Na sprzęcie trzeba potwierdzić:
 4. **VPN po przełączeniu łącza**: handshake wraca w ciągu ~1 min (`status.Vpn.IsConnected`).
 5. **Połączenie przez IPv6 link-local**: laptop ze statycznym IPv4 z innej podsieci → `discover` pokazuje router,
    `find` loguje się adresem `fe80::...%<karta>`.
+6. **Wspólna sieć obiektu** (`SharedSiteNetwork`): urządzenie ze stałym adresem z podsieci parkingu wychodzi do
+   internetu przez router (traceroute: pierwszy skok = adres LAN routera), po odcięciu internetu klienta przechodzi
+   na LTE, a słupek Chipsee nie zmienia bramy po ruchu przez router (brak przekierowań ICMP).
 
 Nie zaimplementowano protokołu MAC-Telnet (logowanie po samym MAC jak w Winboxie): na RouterOS 7 tę rolę pełni
 IPv6 link-local. Jeśli trafią się routery z RouterOS 6 (bez IPv6), MAC-Telnet można dodać jako osobny transport.

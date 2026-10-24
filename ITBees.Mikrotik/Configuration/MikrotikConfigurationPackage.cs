@@ -10,6 +10,8 @@ namespace ITBees.Mikrotik.Configuration;
 /// Octopark admin panel). Defaults describe the standard parking setup on an RB960PGS (hEX PoE):
 /// ether1 = primary internet from the site LAN (DHCP), Huawei E3372 on USB = LTE backup,
 /// ether2-ether5 + sfp1 = parking device LAN, WireGuard tunnel to the central VPN hub.
+/// With <see cref="LanMode.SharedSiteNetwork"/> the parking devices stay on the site network instead and use
+/// the router (its LAN address on ether1) as their gateway.
 /// </summary>
 public sealed class MikrotikConfigurationPackage
 {
@@ -150,17 +152,47 @@ public sealed class FailoverSettings
     public bool FlushConnectionsOnSwitch { get; set; } = true;
 }
 
+/// <summary>Where the parking devices are connected.</summary>
+public enum LanMode
+{
+    /// <summary>
+    /// Parking devices sit behind the router on its own ports (<see cref="LanSettings.Ports"/>), in their own LAN
+    /// with the router's DHCP server. Only the router is connected to the site network (ether1).
+    /// </summary>
+    OwnPorts,
+
+    /// <summary>
+    /// The site network gives no isolation: parking devices stay on the site switches, next to the site's own
+    /// devices and DHCP server, and the router is connected to that network with a single cable (ether1). Two
+    /// subnets share the wire: the site network (DHCP, the router's uplink) and the parking subnet
+    /// (<see cref="LanSettings.Address"/>), whose devices have static addresses and the router as their gateway.
+    /// The router puts its LAN address on ether1, runs no DHCP server (it would answer the site's devices), accepts
+    /// traffic from ether1 only from the parking subnet and does not send ICMP redirects (they would point devices
+    /// at the site router and bypass the failover). <see cref="LanSettings.Ports"/> stay as service ports without
+    /// an IPv4 address (reachable over IPv6 link-local). A factory router is applied once from such a port (its
+    /// factory address and DHCP live there), which drops that session at the end.
+    /// </summary>
+    SharedSiteNetwork,
+}
+
 public sealed class LanSettings
 {
+    /// <summary>Own ports behind the router (default) or the parking subnet on the site network, see <see cref="LanMode"/>.</summary>
+    public LanMode Mode { get; set; } = LanMode.OwnPorts;
+
     public string BridgeName { get; set; } = "bridge";
 
-    /// <summary>Ports in the parking LAN bridge (RB960PGS: ether2-ether5 with PoE out, sfp1).</summary>
+    /// <summary>
+    /// Ports in the parking LAN bridge (RB960PGS: ether2-ether5 with PoE out, sfp1). In
+    /// <see cref="LanMode.SharedSiteNetwork"/> they are service ports without an IPv4 address.
+    /// </summary>
     public List<string> Ports { get; set; } = new() { "ether2", "ether3", "ether4", "ether5", "sfp1" };
 
     /// <summary>
     /// Router address with prefix, e.g. "10.64.12.1/24". Use a different subnet for each parking when devices
     /// behind the router must be reachable over the VPN. Applied as the very last step, because it changes the
-    /// address a computer on the LAN uses to reach the router.
+    /// address a computer on the LAN uses to reach the router. In <see cref="LanMode.SharedSiteNetwork"/> it is set
+    /// on the WAN port and must not overlap the site network.
     /// </summary>
     public string Address { get; set; } = "192.168.88.1/24";
 
@@ -172,6 +204,7 @@ public sealed class LanSettings
 
 public sealed class DhcpServerSettings
 {
+    /// <summary>Must be false in <see cref="LanMode.SharedSiteNetwork"/>: the site network already has a DHCP server.</summary>
     public bool Enabled { get; set; } = true;
 
     /// <summary>First pool address; default .100 (or the address after the router for small subnets).</summary>

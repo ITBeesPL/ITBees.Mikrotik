@@ -426,6 +426,7 @@ internal sealed class FakeRouterOs : IAsyncDisposable
         Singletons["/tool/mac-server"] = new() { ["allowed-interface-list"] = "LAN" };
         Singletons["/tool/mac-server/mac-winbox"] = new() { ["allowed-interface-list"] = "LAN" };
         Singletons["/tool/bandwidth-server"] = new() { ["enabled"] = "true" };
+        Singletons["/ip/settings"] = new() { ["ip-forward"] = "true", ["send-redirects"] = "true", ["accept-redirects"] = "false" };
 
         foreach (var menu in new[]
                  {

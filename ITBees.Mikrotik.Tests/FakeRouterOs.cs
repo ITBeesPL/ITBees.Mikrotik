@@ -340,6 +340,8 @@ internal sealed class FakeRouterOs : IAsyncDisposable
                 row["private-key"] = WireGuardKeys.GeneratePrivateKey();
             row["public-key"] = WireGuardKeys.GetPublicKey(row["private-key"]);
         }
+        if (menu == "/system/scheduler" && Singletons.TryGetValue("/system/device-mode", out var deviceMode) && deviceMode.GetValueOrDefault("scheduler") == "no")
+            throw new TrapException("failure: not allowed by device-mode");
         if (menu == "/ip/dhcp-client")
         {
             if (rows.Any(r => r.GetValueOrDefault("interface") == row["interface"]))
@@ -386,6 +388,16 @@ internal sealed class FakeRouterOs : IAsyncDisposable
             row["public-key"] = WireGuardKeys.GetPublicKey(row["private-key"]);
         if (menu == "/interface/lte/apn" && !ApnProfileAppliesOnReconnect)
             ApplyApnProfileToDhcpClients(row);
+    }
+
+    /// <summary>
+    /// RouterOS 7.17+ device-mode (/system/device-mode). "home" (factory mode of home routers) blocks the scheduler;
+    /// "basic" and "advanced" allow it. Without this call the menu does not exist, as before 7.13.
+    /// </summary>
+    public void UseDeviceMode(string mode)
+    {
+        lock (_sync)
+            Singletons["/system/device-mode"] = new() { ["mode"] = mode, ["scheduler"] = mode == "home" ? "no" : "yes", ["fetch"] = mode == "home" ? "no" : "yes", ["flagged"] = "no" };
     }
 
     /// <summary>

@@ -289,7 +289,10 @@ public sealed class VpnSettings
     /// <summary>Allow parking devices to reach VPN networks (e.g. a central Octopark server).</summary>
     public bool AllowLanToVpn { get; set; } = true;
 
-    /// <summary>Scheduler script that forces a new handshake (and DNS re-resolution) when the tunnel goes quiet.</summary>
+    /// <summary>
+    /// Script run every minute that forces a new handshake (and DNS re-resolution) when the tunnel goes quiet.
+    /// The scheduler runs it, or netwatch when the router's device-mode blocks the scheduler.
+    /// </summary>
     public bool Watchdog { get; set; } = true;
 
     public int WatchdogHandshakeTimeoutSeconds { get; set; } = 180;

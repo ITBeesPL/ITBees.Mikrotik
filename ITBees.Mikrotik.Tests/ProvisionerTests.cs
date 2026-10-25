@@ -278,6 +278,52 @@ public class ProvisionerTests
     }
 
     [Fact]
+    public async Task HomeDeviceMode_RunsTheVpnWatchdogFromNetwatch()
+    {
+        // RouterOS 7.17+ ships home routers in device-mode "home", which refuses /system/scheduler.
+        await using var fake = FakeRouterOs.StartFactoryRb960();
+        fake.UseDeviceMode("home");
+        var package = TestData.ParkingPackage();
+
+        var result = await ApplyAsync(fake, TestData.FactoryPassword, package);
+
+        Assert.True(result.Success, Describe(result));
+        Assert.Empty(fake.Table("/system/scheduler"));
+        Assert.Contains("last-handshake", fake.Row("/system/script", "name", "itbees-vpn-watchdog")!["source"]);
+        var timer = fake.Row("/tool/netwatch", "comment", "itbees:vpn-watchdog")!;
+        Assert.Equal(("10.250.0.12", "1m", "/system script run itbees-vpn-watchdog"), (timer["host"], timer["interval"], timer["test-script"]));
+        Assert.Contains("device-mode home", result.Steps.Single(s => s.Name == "VPN").Message);
+
+        var second = await ApplyAsync(fake, TestData.NewPassword, package);
+        Assert.True(second.Success, Describe(second));
+        Assert.True(second.ChangeCount == 0, Describe(second));
+
+        // Device-mode switched on site: the scheduler takes over and the netwatch timer goes.
+        fake.UseDeviceMode("advanced");
+        var third = await ApplyAsync(fake, TestData.NewPassword, package);
+        Assert.True(third.Success, Describe(third));
+        Assert.Equal("1m", fake.Row("/system/scheduler", "name", "itbees-vpn-watchdog")!["interval"]);
+        Assert.Null(fake.Row("/tool/netwatch", "comment", "itbees:vpn-watchdog"));
+        Assert.NotNull(fake.Row("/tool/netwatch", "comment", "itbees:uplink-monitor"));
+    }
+
+    [Fact]
+    public async Task HomeDeviceMode_DisablingVpn_RemovesTheNetwatchWatchdog()
+    {
+        await using var fake = FakeRouterOs.StartFactoryRb960();
+        fake.UseDeviceMode("home");
+        var package = TestData.ParkingPackage();
+        Assert.True((await ApplyAsync(fake, TestData.FactoryPassword, package)).Success);
+
+        package.Vpn.Enabled = false;
+        var result = await ApplyAsync(fake, TestData.NewPassword, package);
+
+        Assert.True(result.Success, Describe(result));
+        Assert.Null(fake.Row("/tool/netwatch", "comment", "itbees:vpn-watchdog"));
+        Assert.Null(fake.Row("/system/script", "name", "itbees-vpn-watchdog"));
+    }
+
+    [Fact]
     public async Task DisablingVpn_RemovesTunnelAndWatchdog()
     {
         await using var fake = FakeRouterOs.StartFactoryRb960();

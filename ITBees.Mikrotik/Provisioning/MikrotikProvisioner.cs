@@ -64,6 +64,8 @@ internal sealed class ProvisioningRun
 
     private HashSet<string> _interfaces = new(StringComparer.Ordinal);
     private bool _ltePresent;
+    private bool _schedulerAllowed = true;
+    private string? _deviceMode;
     private string? _managementInterface;
     private IPAddress? _sessionAddress;
     private bool _sessionViaLanIpv4;
@@ -152,6 +154,7 @@ internal sealed class ProvisioningRun
             throw Fail($"RouterOS 7 is required (WireGuard, v7 menus); the router runs {device.Version}. Upgrade it first (System > Packages > Check For Updates).");
         if (device.Model != null && !device.Model.Contains("RB960", StringComparison.OrdinalIgnoreCase))
             Warn($"The package is designed for RB960PGS (hEX PoE); this router is {device.Model}. Continuing because the interfaces are checked below.");
+        _schedulerAllowed = await IsSchedulerAllowedAsync(ct).ConfigureAwait(false);
 
         var interfaces = await _writer.PrintAsync("/interface", ct).ConfigureAwait(false);
         _interfaces = interfaces.Select(i => i.Get("name")).OfType<string>().ToHashSet(StringComparer.Ordinal);
@@ -197,6 +200,26 @@ internal sealed class ProvisioningRun
             _wanGateway = lease.Get("gateway");
 
         return new StepOutcome($"RouterOS {device.Version}, {device.Model ?? device.BoardName}, session via {_managementInterface ?? "?"}");
+    }
+
+    /// <summary>
+    /// Since RouterOS 7.17 home routers leave the factory in device-mode "home", which blocks /system/scheduler.
+    /// Changing the mode needs a button press on the router, so the VPN watchdog runs from netwatch instead.
+    /// Versions without device-mode have no such menu.
+    /// </summary>
+    private async Task<bool> IsSchedulerAllowedAsync(CancellationToken ct)
+    {
+        try
+        {
+            var mode = await _writer.GetSingletonAsync("/system/device-mode", ct).ConfigureAwait(false);
+            _deviceMode = mode?.Get("mode");
+            return mode?.GetBool("scheduler") ?? !string.Equals(_deviceMode, "home", StringComparison.OrdinalIgnoreCase);
+        }
+        catch (MikrotikCommandException e)
+        {
+            _logger.LogDebug("No device-mode menu: {Message}", e.Message);
+            return true;
+        }
     }
 
     private IPAddress? ParseSessionAddress()
@@ -937,7 +960,7 @@ internal sealed class ProvisioningRun
         }
         await _writer.RemoveStaleAsync("/ip/route", "itbees:vpn-route-", keepRoutes, "old VPN route", ct).ConfigureAwait(false);
 
-        await EnsureWatchdogAsync(vpn, ct).ConfigureAwait(false);
+        var watchdogNote = await EnsureWatchdogAsync(vpn, ct).ConfigureAwait(false);
 
         var wg = (await _writer.PrintAsync("/interface/wireguard", ct, ("name", name)).ConfigureAwait(false)).FirstOrDefault();
         var publicKey = vpn.PrivateKey != null ? WireGuardKeys.GetPublicKey(vpn.PrivateKey) : wg?.Get("public-key");
@@ -956,17 +979,17 @@ internal sealed class ProvisioningRun
         {
             Warn("The router's WireGuard public key is not known yet (dry run); it is returned after a real apply.");
         }
-        return new StepOutcome($"{name} {vpn.Address} -> {vpn.ServerEndpoint}:{vpn.ServerPort}");
+        return new StepOutcome($"{name} {vpn.Address} -> {vpn.ServerEndpoint}:{vpn.ServerPort}{(watchdogNote != null ? "; " + watchdogNote : string.Empty)}");
     }
 
-    private async Task EnsureWatchdogAsync(VpnSettings vpn, CancellationToken ct)
+    /// <summary>Installs the watchdog script and what runs it every minute; returns a note when netwatch runs it.</summary>
+    private async Task<string?> EnsureWatchdogAsync(VpnSettings vpn, CancellationToken ct)
     {
         const string name = RouterOsScripts.VpnWatchdogName;
         if (!vpn.Watchdog)
         {
-            await RemoveByNameAsync("/system/scheduler", name, ct).ConfigureAwait(false);
-            await RemoveByNameAsync("/system/script", name, ct).ConfigureAwait(false);
-            return;
+            await RemoveWatchdogAsync(ct).ConfigureAwait(false);
+            return null;
         }
         await _writer.EnsureAsync(
                 "/system/script",
@@ -982,22 +1005,56 @@ internal sealed class ProvisioningRun
                 "VPN watchdog script",
                 ct)
             .ConfigureAwait(false);
+
+        if (_schedulerAllowed)
+        {
+            await _writer.EnsureAsync(
+                    "/system/scheduler",
+                    new[] { ("name", name) },
+                    new Props
+                    {
+                        { "name", name },
+                        { "on-event", name },
+                        { "interval", "1m" },
+                        { "start-time", "startup" },
+                        { "policy", "read,write,test" },
+                        { "disabled", "no" },
+                        { "comment", "itbees:vpn-watchdog" },
+                    },
+                    "VPN watchdog schedule (every minute)",
+                    ct)
+                .ConfigureAwait(false);
+            await _writer.RemoveStaleAsync("/tool/netwatch", "itbees:vpn-watchdog", Array.Empty<string>(), "VPN watchdog in netwatch (the scheduler runs it)", ct).ConfigureAwait(false);
+            return null;
+        }
+
+        // Device-mode blocks the scheduler but not netwatch, which runs test-script after every probe. The probe
+        // targets the router's own tunnel address, so it always answers and only serves as a one-minute timer.
         await _writer.EnsureAsync(
-                "/system/scheduler",
-                new[] { ("name", name) },
+                "/tool/netwatch",
+                new[] { ("comment", "itbees:vpn-watchdog") },
                 new Props
                 {
-                    { "name", name },
-                    { "on-event", name },
+                    { "host", _resolved.VpnAddress!.Address.ToString() },
+                    { "type", "simple" },
                     { "interval", "1m" },
-                    { "start-time", "startup" },
-                    { "policy", "read,write,test" },
+                    { "test-script", $"/system script run {name}" },
                     { "disabled", "no" },
                     { "comment", "itbees:vpn-watchdog" },
                 },
-                "VPN watchdog schedule (every minute)",
+                $"VPN watchdog every minute from netwatch (device-mode {_deviceMode ?? "?"} blocks the scheduler)",
                 ct)
             .ConfigureAwait(false);
+        return $"watchdog run by netwatch (device-mode {_deviceMode ?? "?"} blocks the scheduler)";
+    }
+
+    private async Task RemoveWatchdogAsync(CancellationToken ct)
+    {
+        // With the scheduler blocked by device-mode there is nothing of ours to remove there.
+        if (_schedulerAllowed)
+            await RemoveByNameAsync("/system/scheduler", RouterOsScripts.VpnWatchdogName, ct).ConfigureAwait(false);
+        await _writer.RemoveStaleAsync("/tool/netwatch", "itbees:vpn-watchdog", Array.Empty<string>(), "VPN watchdog in netwatch", ct).ConfigureAwait(false);
+        await RemoveByNameAsync("/system/script", RouterOsScripts.VpnWatchdogName, ct).ConfigureAwait(false);
     }
 
     private async Task<StepOutcome> RemoveVpnAsync(CancellationToken ct)
@@ -1022,8 +1079,7 @@ internal sealed class ProvisioningRun
             await _writer.RemoveStaleAsync("/ip/route", "itbees:vpn-route-", Array.Empty<string>(), "VPN route", ct).ConfigureAwait(false);
             await _writer.RemoveAsync("/interface/wireguard", wg.Id!, $"WireGuard interface {name}", ct).ConfigureAwait(false);
         }
-        await RemoveByNameAsync("/system/scheduler", RouterOsScripts.VpnWatchdogName, ct).ConfigureAwait(false);
-        await RemoveByNameAsync("/system/script", RouterOsScripts.VpnWatchdogName, ct).ConfigureAwait(false);
+        await RemoveWatchdogAsync(ct).ConfigureAwait(false);
         return new StepOutcome("VPN removed (disabled in the package)");
     }
 

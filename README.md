@@ -98,6 +98,9 @@ Co zapewnia „tunel zawsze dostępny”:
 - **watchdog** (skrypt co minutę): gdy ostatni handshake jest starszy niż 3 min, ponownie ustawia `endpoint-address`,
   co wymusza nowy handshake i ponowne rozwiązanie nazwy DNS huba (celowo nie disable/enable peera — w RouterOS 7.24
   zgłoszono błąd, przez który ponownie włączony peer nie wraca do pracy);
+  skrypt uruchamia scheduler, a gdy blokuje go tryb urządzenia (RouterOS 7.17+ wysyła routery domowe, np. hEX PoE,
+  w `device-mode=home`; zmiana trybu wymaga przycisku na routerze) — netwatch co minutę (`test-script`, sonda na
+  własny adres tunelu, więc służy tylko jako zegar);
 - port WireGuard jest otwarty na wejściu, więc hub może zainicjować połączenie po zmianie łącza;
 - z VPN dostępne są: router (Winbox/API/SSH/ping) i urządzenia w LAN parkingu (gdy `AllowAccessToLan`).
 

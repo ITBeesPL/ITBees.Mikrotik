@@ -80,8 +80,10 @@ public sealed class MikrotikStatusReader
             .GroupBy(i => i.Get("name")!)
             .ToDictionary(g => g.Key, g => g.First(), StringComparer.Ordinal);
 
+        // The link is the WAN port's; the lease and the primary route are on the bridge in SharedSiteNetwork mode.
         var wanName = package.Wan.Interface;
-        var wanLease = (await PrintAsync(api, "/ip/dhcp-client", cancellationToken, ("interface", wanName)).ConfigureAwait(false)).FirstOrDefault();
+        var leaseInterface = package.WanAddressInterface;
+        var wanLease = (await PrintAsync(api, "/ip/dhcp-client", cancellationToken, ("interface", leaseInterface)).ConfigureAwait(false)).FirstOrDefault();
         var wan = new MikrotikWanStatus(
             wanName,
             interfaces.TryGetValue(wanName, out var wanInterface) && wanInterface.GetBool("running") == true,
@@ -90,7 +92,7 @@ public sealed class MikrotikStatusReader
             wanLease?.Get("gateway"));
 
         var lte = await ReadLteAsync(api, package.Lte.Interface, interfaces, cancellationToken).ConfigureAwait(false);
-        var (uplink, gateway) = await ReadUplinkAsync(api, wanName, lte, cancellationToken).ConfigureAwait(false);
+        var (uplink, gateway) = await ReadUplinkAsync(api, leaseInterface, lte, cancellationToken).ConfigureAwait(false);
         var vpn = await ReadVpnAsync(api, package.Vpn.InterfaceName, interfaces, cancellationToken).ConfigureAwait(false);
         return new MikrotikStatus(device, wan, lte, uplink, gateway, vpn, DateTimeOffset.Now);
     }

@@ -142,7 +142,7 @@ AllowedIPs = 10.250.0.12/32, 10.64.12.0/24
 `result.VpnHubPeer.ToWgSetCommand()` (`wg set wg0 peer ... allowed-ips ...`). Hub może też być MikroTikiem (CHR) —
 `ToRouterOsCommand()`.
 
-## Wspólna sieć obiektu (jeden kabel, bez izolacji)
+## Wspólna sieć obiektu (bez izolacji)
 
 Gdy sieć obiektu nie pozwala przepiąć urządzeń parkingu „za” router (wszystko wisi na switchach klienta, a router
 dostaje jeden kabel), pakiet ustawia się w tryb `Lan.Mode = SharedSiteNetwork`:
@@ -150,8 +150,12 @@ dostaje jeden kabel), pakiet ustawia się w tryb `Lan.Mode = SharedSiteNetwork`:
 ```
 internet ── router klienta (DHCP 192.168.1.x) ──┬── switche obiektu ──┬── urządzenia klienta (DHCP klienta)
                                                │                     └── słupki, kamery, terminale parkingu:
-                                       ether1 MikroTika                  stałe adresy 192.168.23.x,
-                                       (DHCP 192.168.1.57 + 192.168.23.1/24)  brama 192.168.23.1
+                                       ether1 ─┐                         stałe adresy 192.168.23.x, brama 192.168.23.1
+                                               │
+                              MikroTik: bridge = ether1 + ether2–ether5 + sfp1
+                              (DHCP 192.168.1.57 + 192.168.23.1/24 na bridge)
+                                               │
+                         ether2–ether5: kamera, terminal, domofon w kolumnie — też w sieci obiektu
                                                │
                                        LTE (USB) = zapas, WireGuard do huba
 ```
@@ -159,30 +163,39 @@ internet ── router klienta (DHCP 192.168.1.x) ──┬── switche obiekt
 Na jednym kablu działają dwie podsieci: sieć klienta (jego DHCP, przez nią router wychodzi do internetu) i podsieć
 parkingu (`Lan.Address`). Urządzenia parkingu mają **stałe adresy** z podsieci parkingu i router jako bramę, więc ich
 ruch idzie przez router: do internetu przez router klienta, a gdy ten internet padnie — przez LTE. Urządzenia klienta
-niczego nie zauważą.
+niczego nie zauważą. **ether1 jest w jednym mostku z ether2–ether5**, więc urządzenie wpięte w router (np. kamera,
+terminal i domofon w kolumnie wjazdowej) jest w sieci obiektu tak samo jak urządzenie na switchu klienta.
 
 Co pakiet robi inaczej niż w trybie `OwnPorts`:
-- adres LAN routera trafia na **ether1** (obok adresu z DHCP klienta); mostek ether2–ether5 + sfp1 zostaje bez
-  adresu IPv4 jako porty serwisowe (dostępne przez IPv6 link-local),
-- **żadnego serwera DHCP** (`Lan.Dhcp.Enabled` musi być `false`, walidator to sprawdza) — odpowiadałby urządzeniom
-  klienta; `Lan.Dhcp.StaticLeases` są ignorowane (adresy ustawia się na urządzeniach),
-- firewall wpuszcza z ether1 (do routera, do internetu/LTE i do VPN) **tylko podsieć parkingu**; reszta sieci klienta
-  zostaje na zewnątrz,
-- ruch z VPN do urządzeń wychodzi przez ether1, więc maskarada podstawia adres routera — urządzenia odpowiadają
-  w swojej podsieci nawet ze źle ustawioną bramą,
-- `/ip settings send-redirects=no`: ruch wchodzi i wychodzi tym samym portem, a przekierowania ICMP kazałyby
-  urządzeniom (Linux je przyjmuje) iść prosto do routera klienta — z pominięciem failoveru i VPN,
-- sesja przez ether1 nie jest odrzucana w preflight (w tym trybie słupek wdrażający pakiet siedzi w sieci obiektu).
+- **wyłącza każdy serwer DHCP** (`Lan.Dhcp.Enabled` musi być `false`, walidator to sprawdza) — i to *zanim* ether1
+  wejdzie do mostka, żeby fabryczny DHCP 192.168.88.x ani na chwilę nie odpowiadał urządzeniom klienta;
+  `Lan.Dhcp.StaticLeases` są ignorowane (adresy ustawia się na urządzeniach),
+- dodaje ether1 do mostka; klient DHCP sieci obiektu i adres parkingu są na **bridge** (z ether1 znikają adresy
+  i klient DHCP); lista `WAN` = ether1 + bridge + lte1, lista `LAN` = bridge (discovery, MAC-Winbox),
+- firewall nie ufa mostkowi jako całości (to sieć klienta): IPv4 do routera, do internetu/LTE i do VPN — **tylko
+  z podsieci parkingu**, reszta sieci klienta nie może ani zarządzać routerem, ani używać go jako bramy (np. przez
+  nasze LTE); IPv6 tylko link-local (serwis na miejscu), nic nie jest przekazywane,
+- firewall jest instalowany *po* zmianie hasła: przy pierwszym wdrożeniu weryfikacja hasła loguje się drugi raz
+  z 192.168.88.x, czego nowy firewall by już nie wpuścił (otwarta sesja przeżywa jako „established”),
+- ruch z VPN do urządzeń wychodzi przez bridge (lista `WAN`), więc maskarada podstawia adres routera — urządzenia
+  odpowiadają w swojej podsieci nawet ze źle ustawioną bramą,
+- `/ip settings send-redirects=no`: ruch wchodzi i wychodzi przez bridge, a przekierowania ICMP kazałyby
+  urządzeniom (Linux je przyjmuje) iść prosto do routera klienta — z pominięciem failoveru i VPN.
 
 Ograniczenia: urządzenie, które umie tylko DHCP, dostanie bramę od routera klienta i będzie działać bez zapasowego LTE
-i bez dostępu przez VPN. Izolacji nie ma — z sieci klienta da się dojść do urządzeń parkingu (jeśli ktoś doda trasę).
-Podsieć parkingu nie może pokrywać się z siecią klienta (preflight to sprawdza).
+i bez dostępu przez VPN. Izolacji nie ma — z sieci klienta da się dojść do urządzeń parkingu (jeśli ktoś doda trasę),
+a MAC-Winbox i IPv6 link-local routera są widoczne w sieci obiektu (chronione hasłem). Podsieć parkingu nie może
+pokrywać się z siecią klienta (preflight to sprawdza).
 
 **Pierwsze wdrożenie fabrycznego routera:** fabrycznie RouterOS wpuszcza logowanie i discovery tylko od strony
-ether2–ether5, a jego serwer DHCP (192.168.88.x) **nie może trafić do sieci klienta**. Dlatego na czas pierwszego
-wdrożenia: ether1 do sieci obiektu, komputer/słupek wdrażający kablem **bezpośrednio do ether2** (nie przez switch
-obiektu). Po wdrożeniu mostek traci adres 192.168.88.1 (sesja się kończy — `ReconnectRequired`), a słupek wraca do
-sieci obiektu i od tej pory łączy się z routerem adresem z podsieci parkingu na ether1.
+ether2–ether5. Dlatego: ether1 do sieci obiektu, słupek wdrażający kablem **do ether2** (bezpośrednio, nie przez
+switch obiektu — fabryczny DHCP nie może trafić do sieci klienta przed wdrożeniem). Po wdrożeniu ether2 jest już
+w sieci obiektu: słupek może zostać na tym porcie i łączy się z routerem adresem z podsieci parkingu. Dopóki ether1
+nie jest w mostku, preflight odrzuca sesję przez ether1, LTE albo VPN (przeniesienie ether1 by ją przerwało).
+
+**Pomocnik SIP (`Nat.SipHelper`, domyślnie `true` jak w RouterOS):** `/ip firewall service-port sip` przepisuje
+pakiety SIP przechodzące przez NAT. Domofon rejestrujący się do serwera SIP przez router (i NAT klienta za nim)
+często ma wtedy jednostronny dźwięk albo żaden — wtedy `SipHelper = false` (w panelu: przełącznik na karcie routera).
 
 ## Discovery „jak Winbox” i połączenie bez wspólnej podsieci
 
@@ -331,7 +344,9 @@ Na sprzęcie trzeba potwierdzić:
    `find` loguje się adresem `fe80::...%<karta>`.
 6. **Wspólna sieć obiektu** (`SharedSiteNetwork`): urządzenie ze stałym adresem z podsieci parkingu wychodzi do
    internetu przez router (traceroute: pierwszy skok = adres LAN routera), po odcięciu internetu klienta przechodzi
-   na LTE, a słupek Chipsee nie zmienia bramy po ruchu przez router (brak przekierowań ICMP).
+   na LTE, a słupek Chipsee nie zmienia bramy po ruchu przez router (brak przekierowań ICMP). Kamera wpięta w ether2
+   routera jest osiągalna ze słupka na switchu obiektu (jeden mostek), a urządzenie klienta z jego DHCP nie przechodzi
+   przez router do internetu (firewall). Domofon: dźwięk w obie strony z `Nat.SipHelper` włączonym i wyłączonym.
 
 Nie zaimplementowano protokołu MAC-Telnet (logowanie po samym MAC jak w Winboxie): na RouterOS 7 tę rolę pełni
 IPv6 link-local. Jeśli trafią się routery z RouterOS 6 (bez IPv6), MAC-Telnet można dodać jako osobny transport.

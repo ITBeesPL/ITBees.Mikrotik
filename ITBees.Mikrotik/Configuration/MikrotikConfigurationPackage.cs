@@ -10,8 +10,8 @@ namespace ITBees.Mikrotik.Configuration;
 /// Octopark admin panel). Defaults describe the standard parking setup on an RB960PGS (hEX PoE):
 /// ether1 = primary internet from the site LAN (DHCP), Huawei E3372 on USB = LTE backup,
 /// ether2-ether5 + sfp1 = parking device LAN, WireGuard tunnel to the central VPN hub.
-/// With <see cref="LanMode.SharedSiteNetwork"/> the parking devices stay on the site network instead and use
-/// the router (its LAN address on ether1) as their gateway.
+/// With <see cref="LanMode.SharedSiteNetwork"/> the parking devices stay on the site network instead (ether1 joins
+/// the bridge, so the router's other ports are site-network ports too) and use the router as their gateway.
 /// </summary>
 public sealed class MikrotikConfigurationPackage
 {
@@ -37,6 +37,15 @@ public sealed class MikrotikConfigurationPackage
     public TimeSettings Time { get; set; } = new();
 
     public VpnSettings Vpn { get; set; } = new();
+
+    public NatSettings Nat { get; set; } = new();
+
+    /// <summary>
+    /// Interface that carries the site DHCP lease: the WAN port, or the LAN bridge when the WAN port is one of its
+    /// ports (<see cref="LanMode.SharedSiteNetwork"/>).
+    /// </summary>
+    [JsonIgnore]
+    public string WanAddressInterface => Lan.Mode == LanMode.SharedSiteNetwork ? Lan.BridgeName : Wan.Interface;
 
     public static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -163,14 +172,17 @@ public enum LanMode
 
     /// <summary>
     /// The site network gives no isolation: parking devices stay on the site switches, next to the site's own
-    /// devices and DHCP server, and the router is connected to that network with a single cable (ether1). Two
-    /// subnets share the wire: the site network (DHCP, the router's uplink) and the parking subnet
+    /// devices and DHCP server, and the router is connected to that network with one cable (ether1). Two subnets
+    /// share the wire: the site network (DHCP, the router's uplink) and the parking subnet
     /// (<see cref="LanSettings.Address"/>), whose devices have static addresses and the router as their gateway.
-    /// The router puts its LAN address on ether1, runs no DHCP server (it would answer the site's devices), accepts
-    /// traffic from ether1 only from the parking subnet and does not send ICMP redirects (they would point devices
-    /// at the site router and bypass the failover). <see cref="LanSettings.Ports"/> stay as service ports without
-    /// an IPv4 address (reachable over IPv6 link-local). A factory router is applied once from such a port (its
-    /// factory address and DHCP live there), which drops that session at the end.
+    /// ether1 joins the bridge with <see cref="LanSettings.Ports"/>, so a camera, payment terminal or intercom
+    /// plugged into the router (e.g. in an entry column) is in the site network like a device on the site switches.
+    /// The site lease and the LAN address both live on the bridge. The router runs no DHCP server (it would answer
+    /// the site's devices), lets in and routes IPv4 only from the parking subnet (the rest of the site network can
+    /// neither manage it nor use it as a gateway; L2 service access — MAC-Winbox, IPv6 link-local — stays) and
+    /// sends no ICMP redirects (they would point devices at the site router and bypass the failover).
+    /// A factory router is applied once from ether2-ether5 (login and discovery are factory-limited to those
+    /// ports); a session over ether1, LTE or the VPN is refused until ether1 is a bridge port.
     /// </summary>
     SharedSiteNetwork,
 }
@@ -184,15 +196,15 @@ public sealed class LanSettings
 
     /// <summary>
     /// Ports in the parking LAN bridge (RB960PGS: ether2-ether5 with PoE out, sfp1). In
-    /// <see cref="LanMode.SharedSiteNetwork"/> they are service ports without an IPv4 address.
+    /// <see cref="LanMode.SharedSiteNetwork"/> the WAN port joins them, so they are site-network ports.
     /// </summary>
     public List<string> Ports { get; set; } = new() { "ether2", "ether3", "ether4", "ether5", "sfp1" };
 
     /// <summary>
     /// Router address with prefix, e.g. "10.64.12.1/24". Use a different subnet for each parking when devices
     /// behind the router must be reachable over the VPN. Applied as the very last step, because it changes the
-    /// address a computer on the LAN uses to reach the router. In <see cref="LanMode.SharedSiteNetwork"/> it is set
-    /// on the WAN port and must not overlap the site network.
+    /// address a computer on the LAN uses to reach the router. In <see cref="LanMode.SharedSiteNetwork"/> it must
+    /// not overlap the site network.
     /// </summary>
     public string Address { get; set; } = "192.168.88.1/24";
 
@@ -227,6 +239,16 @@ public sealed class StaticLease
 
     /// <summary>Description shown in Winbox, e.g. "barrier entry".</summary>
     public string? Comment { get; set; }
+}
+
+public sealed class NatSettings
+{
+    /// <summary>
+    /// RouterOS SIP helper (ALG, /ip firewall service-port "sip"): rewrites SIP messages that pass the NAT. On by
+    /// default in RouterOS. An intercom registered to a SIP server through the router (and the site NAT behind it)
+    /// often has one-way or no audio with it on — turn it off then.
+    /// </summary>
+    public bool SipHelper { get; set; } = true;
 }
 
 public sealed class DnsSettings

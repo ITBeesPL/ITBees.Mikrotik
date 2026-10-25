@@ -346,7 +346,15 @@ internal sealed class FakeRouterOs : IAsyncDisposable
         {
             if (rows.Any(r => r.GetValueOrDefault("interface") == row["interface"]))
                 throw new TrapException("failure: dhcp-client on that interface already exists");
-            row.TryAdd("status", row["interface"] == "ether1" ? "bound" : "searching...");
+            // The site network (10.0.5.0/24) answers on ether1, or on the bridge once ether1 is one of its ports.
+            var onSiteNetwork = row["interface"] == "ether1"
+                                || Tables["/interface/bridge/port"].Any(p => p.GetValueOrDefault("interface") == "ether1" && p.GetValueOrDefault("bridge") == row["interface"]);
+            row.TryAdd("status", onSiteNetwork ? "bound" : "searching...");
+            if (onSiteNetwork)
+            {
+                row.TryAdd("address", "10.0.5.23/24");
+                row.TryAdd("gateway", "10.0.5.1");
+            }
         }
 
         var id = NewId();
@@ -493,6 +501,7 @@ internal sealed class FakeRouterOs : IAsyncDisposable
                      "/interface/wireguard/peers", "/interface/lte", "/interface/lte/apn", "/ip/address", "/ipv6/address", "/ip/pool", "/ip/dhcp-server",
                      "/ip/dhcp-server/network", "/ip/dhcp-server/lease", "/ip/dhcp-client", "/ip/dns/static", "/ip/route", "/ip/firewall/filter",
                      "/ip/firewall/nat", "/ipv6/firewall/filter", "/ip/service", "/user", "/system/script", "/system/scheduler", "/tool/netwatch",
+                     "/ip/firewall/service-port",
                  })
             Tables[menu] = new List<Dictionary<string, string>>();
 
@@ -544,6 +553,8 @@ internal sealed class FakeRouterOs : IAsyncDisposable
         AddDefconfRule("/ipv6/firewall/filter", "input", "accept", "defconf: accept established,related,untracked", ("connection-state", "established,related,untracked"));
         AddDefconfRule("/ipv6/firewall/filter", "input", "drop", "defconf: drop everything else not coming from LAN", ("in-interface-list", "!LAN"));
 
+        foreach (var (helper, ports) in new[] { ("ftp", "21"), ("sip", "5060,5061"), ("pptp", string.Empty) })
+            AddRow("/ip/firewall/service-port", new() { ["name"] = helper, ["ports"] = ports, ["disabled"] = "false" });
         foreach (var (service, port) in new[] { ("telnet", "23"), ("ftp", "21"), ("www", "80"), ("ssh", "22"), ("www-ssl", "443"), ("api", "8728"), ("winbox", "8291"), ("api-ssl", "8729") })
             AddRow("/ip/service", new() { ["name"] = service, ["port"] = port, ["disabled"] = service == "www-ssl" ? "true" : "false" });
         AddRow("/user", new() { ["name"] = "admin", ["group"] = "full", ["password"] = password });

@@ -119,4 +119,93 @@ public class DiscoveryTests
         Assert.Equal(IPAddress.Parse("192.168.88.1"), neighbor.Ipv4Address);
         Assert.Equal(IPAddress.Loopback, neighbor.SourceAddress);
     }
+
+    /// <summary>A router that ignores requests at first and is heard only later (its periodic announcement).</summary>
+    private static async Task<(MndpDiscoveryOptions Options, Func<Task> Stop)> LateResponderAsync(TimeSpan silentFor, Func<MndpDiscoveryOptions, MndpDiscoveryOptions> configure)
+    {
+        var responder = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        var port = ((IPEndPoint)responder.Client.LocalEndPoint!).Port;
+        var stop = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var started = DateTime.UtcNow;
+        var answering = Task.Run(async () =>
+        {
+            try
+            {
+                while (!stop.IsCancellationRequested)
+                {
+                    var request = await responder.ReceiveAsync(stop.Token);
+                    if (request.Buffer.Length == 4 && DateTime.UtcNow - started > silentFor)
+                        await responder.SendAsync(SamplePacket().ToBytes(), request.RemoteEndPoint, stop.Token);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        });
+        var options = configure(new MndpDiscoveryOptions
+        {
+            RequestInterval = TimeSpan.FromMilliseconds(200),
+            ListenPort = 0,
+            TargetPort = port,
+            TargetAddresses = new[] { IPAddress.Loopback },
+            UseIpv6 = false,
+        });
+        return (options, async () =>
+        {
+            stop.Cancel();
+            await answering;
+            responder.Dispose();
+            stop.Dispose();
+        });
+    }
+
+    [Fact]
+    public async Task Discovery_WaitsForALateRouter()
+    {
+        var (options, stop) = await LateResponderAsync(TimeSpan.FromSeconds(1.2), o =>
+        {
+            o.Duration = TimeSpan.FromMilliseconds(400);
+            o.MaxDuration = TimeSpan.FromSeconds(6);
+            o.WaitFor = n => n.MacAddressText == "4C:5E:0C:11:22:33";
+            return o;
+        });
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        var neighbors = await new MndpDiscovery().DiscoverAsync(options);
+        watch.Stop();
+        await stop();
+
+        Assert.Single(neighbors);
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(4), $"stopped after {watch.Elapsed} instead of right after the router answered");
+    }
+
+    [Fact]
+    public async Task Discovery_WithoutWaitFor_StopsAfterDuration()
+    {
+        var (options, stop) = await LateResponderAsync(TimeSpan.FromSeconds(1.5), o =>
+        {
+            o.Duration = TimeSpan.FromMilliseconds(400);
+            return o;
+        });
+        var neighbors = await new MndpDiscovery().DiscoverAsync(options);
+        await stop();
+        Assert.Empty(neighbors);
+    }
+
+    [Fact]
+    public async Task Discovery_GivesUpAtMaxDuration()
+    {
+        var (options, stop) = await LateResponderAsync(TimeSpan.FromSeconds(30), o =>
+        {
+            o.Duration = TimeSpan.FromMilliseconds(200);
+            o.MaxDuration = TimeSpan.FromMilliseconds(900);
+            o.WaitFor = _ => true;
+            return o;
+        });
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        var neighbors = await new MndpDiscovery().DiscoverAsync(options);
+        watch.Stop();
+        await stop();
+        Assert.Empty(neighbors);
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(3), $"listened for {watch.Elapsed}");
+    }
 }

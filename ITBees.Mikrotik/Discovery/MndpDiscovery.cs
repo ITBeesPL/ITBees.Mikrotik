@@ -27,8 +27,28 @@ public sealed class MndpDiscoveryOptions
     /// </summary>
     public IReadOnlyList<IPAddress>? TargetAddresses { get; set; }
 
-    /// <summary>Also discover over IPv6 (RouterOS 7 answers on ff02::1; works regardless of IPv4 addressing).</summary>
+    /// <summary>
+    /// Also discover over IPv6: routers announce themselves on ff02::1 regardless of IPv4 addressing. RouterOS 7.21
+    /// did not answer IPv6 requests in tests, so on an IPv4-less segment it is heard only in its periodic announcements.
+    /// </summary>
     public bool UseIpv6 { get; set; } = true;
+
+    /// <summary>
+    /// Also send IPv4 requests out of every interface that has no IPv4 address (Linux; needs kernel 5.7+ or
+    /// CAP_NET_RAW, otherwise skipped). A request to 255.255.255.255 leaves only through the default route's
+    /// interface (e.g. Wi-Fi), so a router on a cable without IPv4 would never hear it.
+    /// </summary>
+    public bool UseInterfacesWithoutIpv4 { get; set; } = true;
+
+    /// <summary>
+    /// When set, listening goes on after <see cref="Duration"/> until a router matching this predicate is seen or
+    /// <see cref="MaxDuration"/> passes. A router that answers no request on our segment is still found in its
+    /// periodic announcement (every ~20-30 s).
+    /// </summary>
+    public Func<MikrotikNeighbor, bool>? WaitFor { get; set; }
+
+    /// <summary>Longest listening time when <see cref="WaitFor"/> is set.</summary>
+    public TimeSpan MaxDuration { get; set; } = TimeSpan.FromSeconds(35);
 }
 
 /// <summary>
@@ -54,33 +74,43 @@ public sealed class MndpDiscovery
     {
         options ??= new MndpDiscoveryOptions();
         var neighbors = new ConcurrentDictionary<string, MikrotikNeighbor>(StringComparer.Ordinal);
+        var matched = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var listening = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        listening.CancelAfter(options.Duration);
 
-        var sockets = new List<(Socket Socket, bool IsIpv6)>();
+        var sockets = new List<MndpSocket>();
         try
         {
-            sockets.Add((OpenSocket(AddressFamily.InterNetwork, options.ListenPort), false));
+            sockets.Add(new MndpSocket(OpenSocket(AddressFamily.InterNetwork, options.ListenPort), false, null));
             if (options.UseIpv6 && Socket.OSSupportsIPv6)
             {
                 try
                 {
-                    sockets.Add((OpenSocket(AddressFamily.InterNetworkV6, options.ListenPort), true));
+                    sockets.Add(new MndpSocket(OpenSocket(AddressFamily.InterNetworkV6, options.ListenPort), true, null));
                 }
                 catch (SocketException e)
                 {
                     _logger.LogDebug("IPv6 MNDP socket unavailable: {Message}", e.Message);
                 }
             }
+            if (options.UseInterfacesWithoutIpv4 && options.TargetAddresses == null && OperatingSystem.IsLinux())
+            {
+                foreach (var device in InterfacesWithoutIpv4())
+                {
+                    var socket = TryOpenDeviceSocket(device, options.ListenPort);
+                    if (socket != null)
+                        sockets.Add(new MndpSocket(socket, false, device));
+                }
+            }
 
-            var receivers = sockets.Select(s => ReceiveLoopAsync(s.Socket, s.IsIpv6, neighbors, listening.Token)).ToList();
+            var receivers = sockets.Select(s => ReceiveLoopAsync(s.Socket, s.IsIpv6, neighbors, options.WaitFor, matched, listening.Token)).ToList();
             var sender = SendLoopAsync(sockets, options, listening.Token);
-            await Task.WhenAll(receivers.Append(sender)).ConfigureAwait(false);
+            var stopper = StopListeningAsync(options, matched.Task, listening);
+            await Task.WhenAll(receivers.Append(sender).Append(stopper)).ConfigureAwait(false);
         }
         finally
         {
-            foreach (var (socket, _) in sockets)
-                socket.Dispose();
+            foreach (var s in sockets)
+                s.Socket.Dispose();
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -127,11 +157,37 @@ public sealed class MndpDiscovery
         }
     }
 
-    private async Task SendLoopAsync(List<(Socket Socket, bool IsIpv6)> sockets, MndpDiscoveryOptions options, CancellationToken cancellationToken)
+    /// <summary>A listening socket; <see cref="Device"/> is set for the IPv4 sockets bound to an interface without IPv4.</summary>
+    private sealed record MndpSocket(Socket Socket, bool IsIpv6, string? Device);
+
+    // A router answering late often sends its IPv4 and IPv6 packets together: give the second one a moment.
+    private static readonly TimeSpan MatchGrace = TimeSpan.FromMilliseconds(300);
+
+    private static async Task StopListeningAsync(MndpDiscoveryOptions options, Task matched, CancellationTokenSource listening)
     {
-        var v4 = sockets.FirstOrDefault(s => !s.IsIpv6).Socket;
-        var v6 = sockets.FirstOrDefault(s => s.IsIpv6).Socket;
+        try
+        {
+            await Task.Delay(options.Duration, listening.Token).ConfigureAwait(false);
+            var extra = options.MaxDuration - options.Duration;
+            if (options.WaitFor != null && !matched.IsCompleted && extra > TimeSpan.Zero)
+            {
+                await Task.WhenAny(matched, Task.Delay(extra, listening.Token)).ConfigureAwait(false);
+                if (matched.IsCompleted)
+                    await Task.Delay(MatchGrace, listening.Token).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        listening.Cancel();
+    }
+
+    private async Task SendLoopAsync(List<MndpSocket> sockets, MndpDiscoveryOptions options, CancellationToken cancellationToken)
+    {
+        var v4 = sockets.FirstOrDefault(s => !s.IsIpv6 && s.Device == null)?.Socket;
+        var v6 = sockets.FirstOrDefault(s => s.IsIpv6)?.Socket;
         var targets = options.TargetAddresses ?? BuildDefaultTargets(v6 != null);
+        var deviceSockets = sockets.Where(s => s.Device != null).ToList();
         try
         {
             while (!cancellationToken.IsCancellationRequested)
@@ -139,17 +195,11 @@ public sealed class MndpDiscovery
                 foreach (var target in targets)
                 {
                     var socket = target.AddressFamily == AddressFamily.InterNetworkV6 ? v6 : v4;
-                    if (socket == null)
-                        continue;
-                    try
-                    {
-                        await socket.SendToAsync(MndpPacket.DiscoveryRequest, SocketFlags.None, new IPEndPoint(target, options.TargetPort), cancellationToken).ConfigureAwait(false);
-                    }
-                    catch (SocketException e)
-                    {
-                        _logger.LogDebug("MNDP request to {Target} failed: {Message}", target, e.Message);
-                    }
+                    if (socket != null)
+                        await SendRequestAsync(socket, new IPEndPoint(target, options.TargetPort), null, cancellationToken).ConfigureAwait(false);
                 }
+                foreach (var device in deviceSockets)
+                    await SendRequestAsync(device.Socket, new IPEndPoint(IPAddress.Broadcast, options.TargetPort), device.Device, cancellationToken).ConfigureAwait(false);
                 await Task.Delay(options.RequestInterval, cancellationToken).ConfigureAwait(false);
             }
         }
@@ -158,7 +208,96 @@ public sealed class MndpDiscovery
         }
     }
 
-    private async Task ReceiveLoopAsync(Socket socket, bool isIpv6, ConcurrentDictionary<string, MikrotikNeighbor> neighbors, CancellationToken cancellationToken)
+    private async Task SendRequestAsync(Socket socket, IPEndPoint target, string? device, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await socket.SendToAsync(MndpPacket.DiscoveryRequest, SocketFlags.None, target, cancellationToken).ConfigureAwait(false);
+        }
+        catch (SocketException e)
+        {
+            _logger.LogDebug("MNDP request to {Target}{Device} failed: {Message}", target, device == null ? string.Empty : " via " + device, e.Message);
+        }
+    }
+
+    // Linux socket option numbers (generic architectures: x86, ARM).
+    private const int SolSocket = 1;
+    private const int SoBindToDevice = 25;
+    private const int IffBroadcast = 0x2;
+
+    /// <summary>
+    /// An IPv4 socket that sends through one interface only (SO_BINDTODEVICE): the kernel sends a broadcast through
+    /// it even without an IPv4 address on that interface. Null when the kernel refuses (before 5.7 without CAP_NET_RAW).
+    /// </summary>
+    private Socket? TryOpenDeviceSocket(string device, int port)
+    {
+        var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        try
+        {
+            socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+            socket.EnableBroadcast = true;
+            TrySetOption(() => socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.PacketInformation, true));
+            socket.SetRawSocketOption(SolSocket, SoBindToDevice, System.Text.Encoding.ASCII.GetBytes(device + "\0"));
+            try
+            {
+                socket.Bind(new IPEndPoint(IPAddress.Any, port));
+            }
+            catch (SocketException e) when (port != 0 && e.SocketErrorCode == SocketError.AddressAlreadyInUse)
+            {
+                socket.Bind(new IPEndPoint(IPAddress.Any, 0));
+            }
+            _logger.LogDebug("MNDP: also sending IPv4 requests out of {Device} (no IPv4 address there).", device);
+            return socket;
+        }
+        catch (Exception e) when (e is SocketException or PlatformNotSupportedException)
+        {
+            _logger.LogDebug("MNDP: cannot send IPv4 requests out of {Device}: {Message}", device, e.Message);
+            socket.Dispose();
+            return null;
+        }
+    }
+
+    /// <summary>Up, broadcast-capable interfaces (cables, Wi-Fi; not tunnels or CAN) without an IPv4 address.</summary>
+    private IEnumerable<string> InterfacesWithoutIpv4()
+    {
+        var names = new List<string>();
+        try
+        {
+            foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (nic.OperationalStatus != OperationalStatus.Up || nic.NetworkInterfaceType is NetworkInterfaceType.Loopback or NetworkInterfaceType.Tunnel or NetworkInterfaceType.Ppp)
+                    continue;
+                if (nic.GetIPProperties().UnicastAddresses.Any(u => u.Address.AddressFamily == AddressFamily.InterNetwork))
+                    continue;
+                if (HasBroadcastFlag(nic.Name))
+                    names.Add(nic.Name);
+            }
+        }
+        catch (NetworkInformationException e)
+        {
+            _logger.LogDebug("Cannot enumerate network interfaces: {Message}", e.Message);
+        }
+        return names;
+    }
+
+    private static bool HasBroadcastFlag(string device)
+    {
+        try
+        {
+            var text = File.ReadAllText($"/sys/class/net/{device}/flags").Trim();
+            if (text.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                text = text[2..];
+            return int.TryParse(text, System.Globalization.NumberStyles.HexNumber, null, out var flags) && (flags & IffBroadcast) != 0;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private async Task ReceiveLoopAsync(
+        Socket socket, bool isIpv6, ConcurrentDictionary<string, MikrotikNeighbor> neighbors,
+        Func<MikrotikNeighbor, bool>? waitFor, TaskCompletionSource matched, CancellationToken cancellationToken)
     {
         var buffer = new byte[2048];
         EndPoint any = new IPEndPoint(isIpv6 ? IPAddress.IPv6Any : IPAddress.Any, 0);
@@ -208,21 +347,21 @@ public sealed class MndpDiscovery
                 LastSeen = DateTimeOffset.Now,
             };
 
+            // Several sockets can receive the same broadcast at once: TryAdd decides which one reports it.
             var key = neighbor.MacAddressText;
-            var isNew = false;
-            neighbors.AddOrUpdate(
-                key,
-                _ =>
-                {
-                    isNew = true;
-                    return neighbor;
-                },
-                (_, existing) => Merge(existing, neighbor));
-            if (isNew)
+            MikrotikNeighbor stored;
+            if (neighbors.TryAdd(key, neighbor))
             {
+                stored = neighbor;
                 _logger.LogDebug("MNDP: {Neighbor}", neighbor);
                 NeighborFound?.Invoke(this, neighbor);
             }
+            else
+            {
+                stored = neighbors.AddOrUpdate(key, neighbor, (_, existing) => Merge(existing, neighbor));
+            }
+            if (waitFor != null && !matched.Task.IsCompleted && waitFor(stored))
+                matched.TrySetResult();
         }
     }
 

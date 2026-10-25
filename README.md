@@ -12,6 +12,7 @@ automatycznym przełączaniem internetu (łącze podstawowe ↔ LTE) i stałym t
 | Zastosowanie pakietu konfiguracyjnego (idempotentnie, z trybem „dry run”) | `ApplyConfigurationAsync()`, `MikrotikProvisioner` |
 | Status: adres od operatora, aktywne łącze, LTE, stan VPN | `GetStatusAsync()` → `MikrotikStatus` |
 | Klucze WireGuard (X25519) i konfiguracja huba VPN | `WireGuardKeys`, `WireGuardHubPeer`, `WireGuardHubConfig` |
+| Modem LTE Huawei HiLink (E3372): stan transmisji danych, APN w modemie | `HiLinkModem.ReadStatusAsync()`, `EnsureApnAsync()` |
 | Surowe API RouterOS (dowolna komenda) | `IMikrotikClient.ExecuteAsync(new RouterOsCommand(...))` |
 
 Wymagania: RouterOS **7.x** na routerze (nowe RB960PGS mają v7; WireGuard jest tylko w v7). Komunikacja przez
@@ -203,6 +204,21 @@ często ma wtedy jednostronny dźwięk albo żaden — wtedy `SipHelper = false`
 sieciowej i nasłuchuje odpowiedzi oraz okresowych ogłoszeń routerów. To działa w warstwie 2, więc router zostanie
 znaleziony nawet wtedy, gdy laptop ma np. statyczne `10.0.0.5`, a router `192.168.88.1`.
 
+Na co uważać (sprawdzone na RB960PGS z RouterOS 7.21.4):
+- router **nie odpowiada na zapytania po IPv6**, tylko po IPv4; po IPv6 słychać jedynie jego okresowe ogłoszenia
+  (co ok. 20–30 s),
+- zapytanie na `255.255.255.255` wychodzi tylko kartą z trasą domyślną (np. Wi-Fi), więc na Linuksie biblioteka
+  wysyła je dodatkowo przez każdą kartę **bez adresu IPv4** (gniazdo z `SO_BINDTODEVICE`, jądro 5.7+ albo
+  CAP_NET_RAW; `UseInterfacesWithoutIpv4`),
+- `WaitFor` + `MaxDuration`: gdy w zwykłym czasie (`Duration`) nie odezwał się szukany router, nasłuch trwa dalej,
+  aż do jego okresowego ogłoszenia,
+- router ogłasza się na każdym porcie mostka **MAC-iem tego portu** (słupek na ether3 widzi MAC ether3, nie mostka);
+  adresy MAC portów są kolejne, a na naklejce jest MAC ether1. `MikrotikLoginScanOptions.KnownMac` przyjmuje więc
+  dowolny MAC routera: hasła trafiają tylko do routerów o MAC-u z tej samej puli (`MikrotikMac.IsNear`), a po
+  zalogowaniu router musi mieć ten MAC na którymś interfejsie (`MikrotikMac.ReadRouterMacsAsync`) — inaczej
+  próba kończy się `WrongDevice`. W ogłoszeniu jest za to adres IPv6 link-local mostka, więc połączenie przez IPv6
+  działa z każdego portu.
+
 Do połączenia biblioteka próbuje kolejno (`MikrotikNeighbor.GetConnectionCandidates()`):
 1. adresu IPv4, jeśli jest w podsieci laptopa,
 2. adresu **IPv6 link-local** routera (z MNDP albo wyliczonego z MAC, EUI-64) — działa niezależnie od adresacji IPv4,
@@ -337,6 +353,13 @@ Na sprzęcie trzeba potwierdzić:
    w Winboxie (albo ustalimy obejście na konkretnej wersji RouterOS).
 2. **Tryb modemu E3372**: firmware 22.x = HiLink (`lte1` + DHCP 192.168.8.x, APN/PIN w panelu http://192.168.8.1),
    21.x = tryb „stick” (wtedy `lte.mode = Modem` + `apn`). Sprawdzić, że `/interface print` pokazuje `lte1`.
+   W trybie HiLink APN ustawia się **w sticku**, nie w RouterOS: adres 192.168.8.x od sticka dostaje się także
+   bez transmisji danych. Używany stick z profilem innego operatora (np. „o2”, `internetn`, przy karcie Play) jest
+   zalogowany do sieci, ale `ConnectionStatus` = 33 (zły profil) i failover nie ma dokąd przełączyć. Stan widać
+   z urządzenia w podsieci parkingu: `http://192.168.8.1/api/monitoring/status` (cookie z `/api/webserver/SesTokInfo`).
+   `HiLinkModem.EnsureApnAsync(apn)` (z komputera za routerem, np. słupka) wybiera profil z tym APN albo zakłada
+   własny profil `itbees`, ustawia go jako domyślny, wyłącza i włącza transmisję danych i czeka na połączenie
+   (sprawdzone na E3372 22.200.09 / WebUI 17.100.11: o2 `internetn` → `internet`, status 33 → 901).
 3. **Failover**: odłączyć internet *za* routerem klienta (nie kabel ether1) → po ok. 20–30 s `status.ActiveUplink`
    = `Backup`; przywrócić → wraca `Primary`. To samo z odłączeniem kabla ether1.
 4. **VPN po przełączeniu łącza**: handshake wraca w ciągu ~1 min (`status.Vpn.IsConnected`).

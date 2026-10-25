@@ -267,6 +267,8 @@ public static class MikrotikConfigurationValidator
             errors.Add("Lte.RouteDistance must be between 2 and 254.");
         if (lte.Mode == LteMode.Modem && string.IsNullOrWhiteSpace(lte.Apn))
             errors.Add("Lte.Apn is required in Modem mode.");
+        if (!string.IsNullOrWhiteSpace(lte.Apn) && !ITBees.Mikrotik.Lte.HiLinkModem.IsValidApn(lte.Apn.Trim()))
+            errors.Add($"Lte.Apn '{lte.Apn}' is not a valid APN (letters, digits, '.', '-', '_').");
         if (lte.Pin != null && (lte.Pin.Length is < 4 or > 8 || !lte.Pin.All(char.IsDigit)))
             errors.Add("Lte.Pin must be 4-8 digits.");
         if (lte.Mode == LteMode.HiLink)

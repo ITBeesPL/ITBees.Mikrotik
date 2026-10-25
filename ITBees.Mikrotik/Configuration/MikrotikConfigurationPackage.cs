@@ -126,7 +126,11 @@ public sealed class LteSettings
 
     public LteMode Mode { get; set; } = LteMode.HiLink;
 
-    /// <summary>APN for <see cref="LteMode.Modem"/> (e.g. "internet").</summary>
+    /// <summary>
+    /// APN, e.g. "internet". <see cref="LteMode.Modem"/>: required, set in RouterOS. <see cref="LteMode.HiLink"/>: optional,
+    /// set in the stick itself with <see cref="ITBees.Mikrotik.Lte.HiLinkModem"/> by the computer that runs the provisioning (RouterOS
+    /// cannot); empty = leave the stick's own profile.
+    /// </summary>
     public string? Apn { get; set; }
 
     /// <summary>SIM PIN for <see cref="LteMode.Modem"/>. In HiLink mode set it in the stick's web panel.</summary>

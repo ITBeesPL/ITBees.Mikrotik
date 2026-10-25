@@ -23,6 +23,9 @@ public enum MikrotikLoginOutcome
     Unreachable,
 
     Error,
+
+    /// <summary>Logged in, but none of the router's interfaces has the MAC we look for: another router.</summary>
+    WrongDevice,
 }
 
 /// <summary>One try of one credential pair on one address of one router.</summary>
@@ -37,8 +40,16 @@ public sealed class MikrotikLoginScanOptions
     /// <summary>Credential pairs tried in order on each router, e.g. the standard parking password first, then the sticker password.</summary>
     public IList<MikrotikCredentials> Credentials { get; set; } = new List<MikrotikCredentials>();
 
-    /// <summary>Optional filter, e.g. only RB960PGS or a known MAC.</summary>
+    /// <summary>Optional filter, e.g. only RB960PGS.</summary>
     public Func<MikrotikNeighbor, bool>? Filter { get; set; }
+
+    /// <summary>
+    /// MAC of the router we look for: the one it announced before, its bridge MAC or the ether1 MAC from the label.
+    /// RouterOS announces each port with that port's MAC, so routers whose MAC is near this one are tried as well
+    /// (<see cref="MikrotikMac.IsNear"/>) and accepted after login only when one of their interfaces has this MAC.
+    /// Credentials never go to a router whose MAC is unrelated.
+    /// </summary>
+    public string? KnownMac { get; set; }
 
     public int MaxParallelism { get; set; } = 4;
 
@@ -95,10 +106,16 @@ public sealed class MikrotikLoginScanner
         if (options.Credentials.Count == 0)
             throw new ArgumentException("At least one credential pair is required.", nameof(options));
 
-        var candidates = neighbors.Where(n => options.Filter?.Invoke(n) ?? true).ToList();
+        var all = neighbors.ToList();
+        var knownMac = MikrotikMac.Normalize(options.KnownMac);
+        var candidates = all
+            .Where(n => options.Filter?.Invoke(n) ?? true)
+            .Where(n => knownMac == null || IsCandidateFor(knownMac, n))
+            .OrderBy(n => knownMac != null && n.MacAddressText == knownMac ? 0 : 1)
+            .ToList();
         var attempts = new ConcurrentQueue<MikrotikLoginAttempt>();
         if (candidates.Count == 0)
-            throw new MikrotikDeviceNotFoundException("No MikroTik router was found on the network (or none matched the filter). Connect this computer to a LAN port (ether2-ether5) of the router.", Array.Empty<MikrotikLoginAttempt>());
+            throw new MikrotikDeviceNotFoundException(NothingToTryMessage(all, knownMac), Array.Empty<MikrotikLoginAttempt>());
 
         using var stop = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         using var throttle = new SemaphoreSlim(Math.Max(1, options.MaxParallelism));
@@ -117,7 +134,7 @@ public sealed class MikrotikLoginScanner
             }
             try
             {
-                var found = await TryDeviceAsync(neighbor, options, attempts, stop.Token).ConfigureAwait(false);
+                var found = await TryDeviceAsync(neighbor, options, knownMac, attempts, stop.Token).ConfigureAwait(false);
                 if (found == null)
                     return;
                 if (winner.TrySetResult((found.Value.Client, neighbor, found.Value.Credentials)))
@@ -145,14 +162,47 @@ public sealed class MikrotikLoginScanner
         }
 
         var reachable = list.Count(a => a.Outcome is MikrotikLoginOutcome.AuthenticationFailed or MikrotikLoginOutcome.PasswordExpired);
-        var message = reachable > 0
-            ? $"None of the {candidates.Count} router(s) accepted the given credentials ({reachable} rejected login, details in Attempts)."
-            : $"Found {candidates.Count} router(s) but none was reachable over the API (port {options.Port ?? (options.UseTls ? 8729 : 8728)}). Details in Attempts.";
+        var message = list.Any(a => a.Outcome == MikrotikLoginOutcome.WrongDevice) && reachable == 0
+            ? $"Logged in to {candidates.Count} router(s), but none has an interface with MAC {knownMac} (another router). If the router was replaced, drop the old MAC. Details in Attempts."
+            : reachable > 0
+                ? $"None of the {candidates.Count} router(s) accepted the given credentials ({reachable} rejected login, details in Attempts)."
+                : $"Found {candidates.Count} router(s) but none was reachable over the API (port {options.Port ?? (options.UseTls ? 8729 : 8728)}). Details in Attempts.";
         throw new MikrotikDeviceNotFoundException(message, list);
     }
 
+    private static bool IsCandidateFor(string knownMac, MikrotikNeighbor neighbor) =>
+        neighbor.MacAddressText == knownMac || MikrotikMac.IsNear(LinkLocal.ParseMac(knownMac), neighbor.MacAddress);
+
+    private static string NothingToTryMessage(IReadOnlyList<MikrotikNeighbor> all, string? knownMac)
+    {
+        if (all.Count == 0)
+            return "No MikroTik router was found on the network. Connect this computer to a LAN port (ether2-ether5) of the router.";
+        var seen = string.Join(", ", all.Take(5).Select(n => $"{n.MacAddressText} {n.Identity ?? "?"}"));
+        return knownMac != null
+            ? $"Found {all.Count} MikroTik router(s), but none is the one with MAC {knownMac} (seen: {seen}). If the router was replaced, drop the old MAC."
+            : $"Found {all.Count} MikroTik router(s), but none matched the filter (seen: {seen}).";
+    }
+
+    /// <summary>
+    /// Whether the logged-in router is the one with <paramref name="knownMac"/>: announced with exactly that MAC, or
+    /// one of its interfaces has it. Null when the router could not be asked.
+    /// </summary>
+    private static async Task<bool?> IsSameRouterAsync(MikrotikClient client, MikrotikNeighbor neighbor, string knownMac)
+    {
+        if (neighbor.MacAddressText == knownMac)
+            return true;
+        try
+        {
+            return (await MikrotikMac.ReadRouterMacsAsync(client).ConfigureAwait(false)).Contains(knownMac);
+        }
+        catch (Exception e) when (e is MikrotikException or IOException)
+        {
+            return null;
+        }
+    }
+
     private async Task<(MikrotikClient Client, MikrotikCredentials Credentials)?> TryDeviceAsync(
-        MikrotikNeighbor neighbor, MikrotikLoginScanOptions options, ConcurrentQueue<MikrotikLoginAttempt> attempts, CancellationToken cancellationToken)
+        MikrotikNeighbor neighbor, MikrotikLoginScanOptions options, string? knownMac, ConcurrentQueue<MikrotikLoginAttempt> attempts, CancellationToken cancellationToken)
     {
         var addresses = neighbor.GetConnectionCandidates();
         if (addresses.Count == 0)
@@ -182,6 +232,13 @@ public sealed class MikrotikLoginScanner
                 try
                 {
                     var client = await MikrotikClient.ConnectAsync(connection, _loggerFactory.CreateLogger<MikrotikClient>(), cancellationToken).ConfigureAwait(false);
+                    if (knownMac != null && await IsSameRouterAsync(client, neighbor, knownMac).ConfigureAwait(false) != true)
+                    {
+                        attempts.Enqueue(new MikrotikLoginAttempt(neighbor, host, credentials.Username, MikrotikLoginOutcome.WrongDevice,
+                            $"no interface of this router has MAC {knownMac}"));
+                        await client.DisposeAsync().ConfigureAwait(false);
+                        return null;
+                    }
                     attempts.Enqueue(new MikrotikLoginAttempt(neighbor, host, credentials.Username, MikrotikLoginOutcome.Success, null));
                     return (client, credentials);
                 }

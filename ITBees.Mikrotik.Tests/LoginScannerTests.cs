@@ -86,6 +86,66 @@ public class LoginScannerTests
     }
 
     [Fact]
+    public async Task KnownMac_FindsTheRouterOnAnotherPort()
+    {
+        // The label shows ether1 (…:22); the column sits on ether3 and hears that port's MAC (…:24).
+        await using var router = FakeRouterOs.StartFactoryRb960(password: "sticker");
+        var result = await new MikrotikLoginScanner().FindAsync(
+            new[] { Neighbor("4C:5E:0C:11:22:24", ipv4: IPAddress.Loopback) },
+            new MikrotikLoginScanOptions
+            {
+                Credentials = { new MikrotikCredentials("admin", "sticker") },
+                KnownMac = "4c-5e-0c-11-22-22",
+                Port = router.Port,
+            });
+        await using var client = result.Client;
+        Assert.Equal("4C:5E:0C:11:22:24", result.Device.MacAddressText);
+    }
+
+    [Fact]
+    public async Task KnownMac_RejectsANeighbouringRouterWithoutThatMac()
+    {
+        // MAC close to the known one, but no interface of this router has it: the next router from the same batch.
+        await using var router = FakeRouterOs.StartFactoryRb960(password: "sticker");
+        var e = await Assert.ThrowsAsync<MikrotikDeviceNotFoundException>(() => new MikrotikLoginScanner().FindAsync(
+            new[] { Neighbor("4C:5E:0C:11:22:24", ipv4: IPAddress.Loopback) },
+            new MikrotikLoginScanOptions
+            {
+                Credentials = { new MikrotikCredentials("admin", "sticker") },
+                KnownMac = "4C:5E:0C:11:22:2C",
+                Port = router.Port,
+            }));
+        var attempt = Assert.Single(e.Attempts);
+        Assert.Equal(MikrotikLoginOutcome.WrongDevice, attempt.Outcome);
+        Assert.Contains("4C:5E:0C:11:22:2C", e.Message);
+    }
+
+    [Fact]
+    public async Task KnownMac_NeverSendsCredentialsToAnUnrelatedRouter()
+    {
+        await using var router = FakeRouterOs.StartFactoryRb960(password: "sticker");
+        var e = await Assert.ThrowsAsync<MikrotikDeviceNotFoundException>(() => new MikrotikLoginScanner().FindAsync(
+            new[] { Neighbor("D4:01:C3:AA:BB:CC", ipv4: IPAddress.Loopback) },
+            new MikrotikLoginScanOptions
+            {
+                Credentials = { new MikrotikCredentials("admin", "sticker") },
+                KnownMac = "4C:5E:0C:11:22:22",
+                Port = router.Port,
+            }));
+        Assert.Empty(e.Attempts);
+        Assert.Contains("D4:01:C3:AA:BB:CC", e.Message);
+        Assert.Contains("replaced", e.Message);
+    }
+
+    [Theory]
+    [InlineData("4C:5E:0C:11:22:22", "4C:5E:0C:11:22:26", true)]
+    [InlineData("4C:5E:0C:11:22:FE", "4C:5E:0C:11:23:01", true)] // carry into the fifth byte
+    [InlineData("4C:5E:0C:11:22:22", "4C:5E:0C:11:22:40", false)]
+    [InlineData("4C:5E:0C:11:22:22", "D4:01:C3:11:22:23", false)] // other vendor prefix
+    public void MikrotikMac_IsNear(string known, string candidate, bool expected) =>
+        Assert.Equal(expected, MikrotikMac.IsNear(LinkLocal.ParseMac(known), LinkLocal.ParseMac(candidate)));
+
+    [Fact]
     public async Task EmptyNetwork_GivesAClearError()
     {
         var e = await Assert.ThrowsAsync<MikrotikDeviceNotFoundException>(() => new MikrotikLoginScanner().FindAsync(

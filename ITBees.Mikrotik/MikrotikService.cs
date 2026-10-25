@@ -63,6 +63,12 @@ public interface IMikrotikService
 
     Task<MikrotikStatus> GetStatusAsync(IMikrotikClient client, MikrotikConfigurationPackage? package = null, CancellationToken cancellationToken = default);
 
+    /// <summary>Ethernet ports: link, speed, PoE and the devices learned on each. See <see cref="MikrotikPorts"/>.</summary>
+    Task<IReadOnlyList<MikrotikPortStatus>> GetPortsAsync(IMikrotikClient client, CancellationToken cancellationToken = default);
+
+    /// <summary>PoE output of the port off for a while and back on (restarts a PoE camera). Returns what was done.</summary>
+    Task<string> PowerCyclePortAsync(IMikrotikClient client, string port, TimeSpan duration, CancellationToken cancellationToken = default);
+
     /// <summary>Discover, find the router that accepts the credentials, apply the package, close the session.</summary>
     Task<MikrotikSetupResult> SetupAsync(MikrotikSetupRequest request, CancellationToken cancellationToken = default);
 }
@@ -93,6 +99,12 @@ public sealed class MikrotikService : IMikrotikService
 
     public Task<MikrotikStatus> GetStatusAsync(IMikrotikClient client, MikrotikConfigurationPackage? package = null, CancellationToken cancellationToken = default) =>
         new MikrotikStatusReader().ReadAsync(client, package, cancellationToken);
+
+    public Task<IReadOnlyList<MikrotikPortStatus>> GetPortsAsync(IMikrotikClient client, CancellationToken cancellationToken = default) =>
+        MikrotikPorts.ReadAsync(client, cancellationToken);
+
+    public Task<string> PowerCyclePortAsync(IMikrotikClient client, string port, TimeSpan duration, CancellationToken cancellationToken = default) =>
+        MikrotikPorts.PowerCycleAsync(client, port, duration, cancellationToken);
 
     public async Task<MikrotikSetupResult> SetupAsync(MikrotikSetupRequest request, CancellationToken cancellationToken = default)
     {

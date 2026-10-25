@@ -284,6 +284,16 @@ internal sealed class FakeRouterOs : IAsyncDisposable
                         Move(menu, attributes);
                         replies.Add(new List<string> { "!done" });
                         break;
+                    case "monitor":
+                        Monitor(menu, attributes, replies);
+                        break;
+                    case "power-cycle" when menu == "/interface/ethernet/poe":
+                        var port = attributes.GetValueOrDefault("numbers", string.Empty);
+                        if (!Tables[menu].Any(r => r["name"] == port))
+                            throw new TrapException("no such item");
+                        PowerCycles.Add($"{port} {attributes.GetValueOrDefault("duration")}");
+                        replies.Add(new List<string> { "!done" });
+                        break;
                     default:
                         throw new TrapException("no such command");
                 }
@@ -300,6 +310,40 @@ internal sealed class FakeRouterOs : IAsyncDisposable
                 replies.Add(new List<string> { "!done" });
             }
         }
+    }
+
+    /// <summary>PoE power-cycle commands received: "ether2 5s".</summary>
+    public List<string> PowerCycles { get; } = new();
+
+    /// <summary>poe-out-status / poe-out-power reported by "/interface/ethernet/poe/monitor" per port.</summary>
+    public Dictionary<string, (string Status, string Power)> PoeMonitor { get; } = new();
+
+    private void Monitor(string menu, Dictionary<string, string> attributes, List<List<string>> replies)
+    {
+        var name = attributes.GetValueOrDefault("numbers", string.Empty);
+        Dictionary<string, string> row;
+        if (menu == "/interface/ethernet")
+        {
+            var port = Tables["/interface"].FirstOrDefault(r => r["name"] == name) ?? throw new TrapException("no such item");
+            var running = port.GetValueOrDefault("running") == "true";
+            row = new Dictionary<string, string> { ["name"] = name, ["status"] = running ? "link-ok" : "no-link" };
+            if (running)
+                row["rate"] = "100Mbps";
+        }
+        else if (menu == "/interface/ethernet/poe")
+        {
+            var poe = Tables[menu].FirstOrDefault(r => r["name"] == name) ?? throw new TrapException("no such item");
+            var (status, power) = PoeMonitor.TryGetValue(name, out var reported) ? reported : ("waiting-for-load", "0.0W");
+            row = new Dictionary<string, string> { ["name"] = name, ["poe-out"] = poe["poe-out"], ["poe-out-status"] = status, ["poe-out-power"] = power };
+        }
+        else
+        {
+            throw new TrapException("no such command");
+        }
+        var sentence = new List<string> { "!re" };
+        sentence.AddRange(row.Select(kv => $"={kv.Key}={kv.Value}"));
+        replies.Add(sentence);
+        replies.Add(new List<string> { "!done" });
     }
 
     private void Print(string menu, List<(string Name, string Value)> queries, List<List<string>> replies)
@@ -501,7 +545,7 @@ internal sealed class FakeRouterOs : IAsyncDisposable
                      "/interface/wireguard/peers", "/interface/lte", "/interface/lte/apn", "/ip/address", "/ipv6/address", "/ip/pool", "/ip/dhcp-server",
                      "/ip/dhcp-server/network", "/ip/dhcp-server/lease", "/ip/dhcp-client", "/ip/dns/static", "/ip/route", "/ip/firewall/filter",
                      "/ip/firewall/nat", "/ipv6/firewall/filter", "/ip/service", "/user", "/system/script", "/system/scheduler", "/tool/netwatch",
-                     "/ip/firewall/service-port",
+                     "/ip/firewall/service-port", "/interface/bridge/host", "/ip/arp", "/interface/ethernet/poe",
                  })
             Tables[menu] = new List<Dictionary<string, string>>();
 
@@ -516,6 +560,9 @@ internal sealed class FakeRouterOs : IAsyncDisposable
             AddRow("/interface/lte/apn", new() { ["name"] = "default", ["apn"] = "internet", ["default"] = "true" });
         }
 
+        // hEX PoE: PoE output on ether2-ether5.
+        foreach (var port in new[] { "ether2", "ether3", "ether4", "ether5" })
+            AddRow("/interface/ethernet/poe", new() { ["name"] = port, ["poe-out"] = "auto-on" });
         AddRow("/interface/bridge", new() { ["name"] = "bridge", ["comment"] = "defconf" });
         foreach (var port in new[] { "ether2", "ether3", "ether4", "ether5", "sfp1" })
             AddRow("/interface/bridge/port", new() { ["bridge"] = "bridge", ["interface"] = port, ["comment"] = "defconf" });

@@ -13,6 +13,7 @@ automatycznym przełączaniem internetu (łącze podstawowe ↔ LTE) i stałym t
 | Status: adres od operatora, aktywne łącze, LTE, stan VPN | `GetStatusAsync()` → `MikrotikStatus` |
 | Klucze WireGuard (X25519) i konfiguracja huba VPN | `WireGuardKeys`, `WireGuardHubPeer`, `WireGuardHubConfig` |
 | Modem LTE Huawei HiLink (E3372): stan transmisji danych, APN w modemie | `HiLinkModem.ReadStatusAsync()`, `EnsureApnAsync()` |
+| Porty ethernet: link, prędkość, PoE, urządzenia (MAC z tablicy mostka + IP z ARP/DHCP); restart zasilania PoE (kamera) | `GetPortsAsync()`, `PowerCyclePortAsync()` → `MikrotikPorts` |
 | Surowe API RouterOS (dowolna komenda) | `IMikrotikClient.ExecuteAsync(new RouterOsCommand(...))` |
 
 Wymagania: RouterOS **7.x** na routerze (nowe RB960PGS mają v7; WireGuard jest tylko w v7). Komunikacja przez

@@ -242,6 +242,42 @@ public class ProvisionerTests
     }
 
     [Fact]
+    public async Task HiLinkClientAddedByRouterOs_IsConfiguredThroughTheApnProfile()
+    {
+        // RouterOS 7 adds its own dynamic DHCP client for a HiLink stick and refuses a second one on lte1.
+        await using var fake = FakeRouterOs.StartFactoryRb960();
+        fake.AddRouterOsLteDhcpClient();
+        var package = TestData.ParkingPackage();
+
+        var result = await ApplyAsync(fake, TestData.FactoryPassword, package);
+
+        Assert.True(result.Success, Describe(result));
+        var lte = Assert.Single(fake.Table("/ip/dhcp-client"), c => c["interface"] == "lte1");
+        Assert.Equal("true", lte["dynamic"]);
+        Assert.Equal(("yes", "10", "no"), (lte["add-default-route"], lte["default-route-distance"], lte["use-peer-dns"]));
+        Assert.Contains("added by RouterOS", result.Steps.Single(s => s.Name == "LTE backup").Message);
+        Assert.DoesNotContain(result.Warnings, w => w.Contains("lte1"));
+
+        var second = await ApplyAsync(fake, TestData.NewPassword, package);
+        Assert.True(second.Success, Describe(second));
+        Assert.True(second.ChangeCount == 0, Describe(second));
+    }
+
+    [Fact]
+    public async Task HiLinkClientAddedByRouterOs_WarnsWhenTheProfileWaitsForAReconnect()
+    {
+        await using var fake = FakeRouterOs.StartFactoryRb960();
+        fake.AddRouterOsLteDhcpClient();
+        fake.ApnProfileAppliesOnReconnect = true;
+
+        var result = await ApplyAsync(fake, TestData.FactoryPassword, TestData.ParkingPackage());
+
+        Assert.True(result.Success, Describe(result));
+        Assert.Equal("10", fake.Row("/interface/lte/apn", "name", "default")!["default-route-distance"]);
+        Assert.Contains(result.Warnings, w => w.Contains("still uses route distance 2"));
+    }
+
+    [Fact]
     public async Task DisablingVpn_RemovesTunnelAndWatchdog()
     {
         await using var fake = FakeRouterOs.StartFactoryRb960();

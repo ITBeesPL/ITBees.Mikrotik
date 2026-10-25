@@ -44,6 +44,9 @@ Co dokładnie ustawia pakiet (kolejność kroków jest celowa — patrz „Bezpi
 4. **Listy interfejsów** – `WAN` = ether1 + lte1, `LAN` = bridge, `VPN` = interfejs WireGuard.
 5. **DNS** – stałe serwery (domyślnie 1.1.1.1, 8.8.8.8), router odpowiada na DNS dla LAN-u.
 6. **LTE** – HiLink: klient DHCP na `lte1` z trasą domyślną o odległości 10; tryb `Modem`: profil APN + PIN.
+   Jeśli RouterOS 7 sam założył na `lte1` dynamiczny klient DHCP (tak robi z wieloma stickami HiLink i wtedy
+   nie pozwala dodać drugiego), trasę (odległość 10) i DNS ustawiamy w profilu APN modemu; gdy RouterOS przyjmie
+   je dopiero po ponownym połączeniu modemu, wynik zawiera ostrzeżenie (wyjąć i włożyć modem albo zrestartować router).
 7. **Failover** – trasy rekurencyjne przez hosty kontrolne (patrz niżej) + netwatch czyszczący połączenia NAT przy przełączeniu.
 8. **WAN** – ether1 jako **klient DHCP** (usuwa statyczne adresy), czeka na dzierżawę i zwraca adres od operatora.
 9. **NAT** – maskarada na liście `WAN`.

@@ -454,6 +454,13 @@ internal sealed class ProvisioningRun
         var distance = lte.RouteDistance.ToString(System.Globalization.CultureInfo.InvariantCulture);
         if (lte.Mode == LteMode.HiLink)
         {
+            // RouterOS 7 adds its own dynamic DHCP client for many HiLink (ECM) sticks and refuses a second
+            // client on the same interface. That client cannot be edited; it takes its settings from the
+            // APN profile of the LTE interface.
+            var clients = await _writer.PrintAsync("/ip/dhcp-client", ct, ("interface", Lte)).ConfigureAwait(false);
+            if (!clients.Any(r => !r.IsDynamic) && clients.FirstOrDefault(r => r.IsDynamic) != null)
+                return await LteRouterOsDhcpClientAsync(distance, ct).ConfigureAwait(false);
+
             await _writer.EnsureAsync(
                     "/ip/dhcp-client",
                     new[] { ("interface", Lte) },
@@ -495,6 +502,54 @@ internal sealed class ProvisioningRun
         await _writer.SetAsync("/interface/lte", modem.Id!, diff, $"{Lte} APN profile and PIN", ct).ConfigureAwait(false);
         await _writer.RemoveStaleAsync("/ip/dhcp-client", "itbees:lte", Array.Empty<string>(), "LTE DHCP client (not used in Modem mode)", ct).ConfigureAwait(false);
         return default;
+    }
+
+    /// <summary>
+    /// HiLink stick whose DHCP client RouterOS created itself: the backup route and DNS are set in the APN
+    /// profile the LTE interface uses, which RouterOS copies to that client.
+    /// </summary>
+    private async Task<StepOutcome> LteRouterOsDhcpClientAsync(string distance, CancellationToken ct)
+    {
+        var modem = (await _writer.PrintAsync("/interface/lte", ct, ("name", Lte)).ConfigureAwait(false)).FirstOrDefault();
+        var profileName = modem?.Get("apn-profiles")?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).FirstOrDefault() ?? "default";
+        var profile = (await _writer.PrintAsync("/interface/lte/apn", ct, ("name", profileName)).ConfigureAwait(false)).FirstOrDefault()
+                      ?? throw Fail($"RouterOS manages the DHCP client on {Lte}, but its APN profile '{profileName}' is missing (/interface lte apn).");
+        var desired = new Props
+        {
+            { "add-default-route", "yes" },
+            { "default-route-distance", distance },
+            { "use-peer-dns", "no" },
+        };
+        await _writer.SetAsync(
+                "/interface/lte/apn",
+                profile.Id!,
+                RouterOsStateWriter.Diff(profile, desired),
+                $"APN profile {profileName} of {Lte} (HiLink, DHCP client added by RouterOS, backup default route distance {distance})",
+                ct)
+            .ConfigureAwait(false);
+
+        var managedBy = $"DHCP client added by RouterOS, APN profile {profileName}";
+        if (_writer.DryRun)
+            return new StepOutcome(managedBy);
+
+        // RouterOS may apply the profile to the running client only after the modem reconnects.
+        RouterOsRecord? client = null;
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (true)
+        {
+            client = (await _writer.PrintAsync("/ip/dhcp-client", ct, ("interface", Lte)).ConfigureAwait(false)).FirstOrDefault();
+            var current = client?.Get("default-route-distance");
+            if (current == null || current == distance || DateTime.UtcNow >= deadline)
+                break;
+            await Task.Delay(TimeSpan.FromSeconds(1), ct).ConfigureAwait(false);
+        }
+
+        var currentDistance = client?.Get("default-route-distance");
+        if (currentDistance != null && currentDistance != distance)
+            Warn($"The DHCP client on {Lte} still uses route distance {currentDistance} instead of {distance}: RouterOS applies the APN profile when the modem reconnects. Unplug the LTE stick and plug it back in (or reboot the router).");
+
+        var lease = client?.Get("status") == "bound" ? $"{Lte} got {client.Get("address")}" : $"{Lte} lease: {client?.Get("status") ?? "pending"}";
+        return new StepOutcome($"{lease} ({managedBy})");
     }
 
     private async Task<StepOutcome> FailoverAsync(CancellationToken ct)

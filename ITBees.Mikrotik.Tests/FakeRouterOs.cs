@@ -54,6 +54,9 @@ internal sealed class FakeRouterOs : IAsyncDisposable
     /// <summary>When it returns true for an applied command, the connection is closed without a reply.</summary>
     public Func<string, IReadOnlyDictionary<string, string>, bool>? DropConnectionAfter { get; set; }
 
+    /// <summary>When true, APN profile changes do not reach the RouterOS-made LTE DHCP client until the modem reconnects.</summary>
+    public bool ApnProfileAppliesOnReconnect { get; set; }
+
     public int Logins { get; private set; }
 
     public static FakeRouterOs Start(IPAddress? address = null, int port = 0) => new(address ?? IPAddress.Loopback, port);
@@ -338,7 +341,11 @@ internal sealed class FakeRouterOs : IAsyncDisposable
             row["public-key"] = WireGuardKeys.GetPublicKey(row["private-key"]);
         }
         if (menu == "/ip/dhcp-client")
+        {
+            if (rows.Any(r => r.GetValueOrDefault("interface") == row["interface"]))
+                throw new TrapException("failure: dhcp-client on that interface already exists");
             row.TryAdd("status", row["interface"] == "ether1" ? "bound" : "searching...");
+        }
 
         var id = NewId();
         row[".id"] = id;
@@ -366,6 +373,8 @@ internal sealed class FakeRouterOs : IAsyncDisposable
             return;
         }
         var row = Find(menu, attributes);
+        if (row.GetValueOrDefault("dynamic") == "true")
+            throw new TrapException("failure: can not change dynamic");
         foreach (var (k, v) in attributes)
         {
             if (k is ".id" or "numbers")
@@ -375,6 +384,44 @@ internal sealed class FakeRouterOs : IAsyncDisposable
         ValidateInterfaceReference(menu, row);
         if (menu == "/interface/wireguard" && attributes.ContainsKey("private-key"))
             row["public-key"] = WireGuardKeys.GetPublicKey(row["private-key"]);
+        if (menu == "/interface/lte/apn" && !ApnProfileAppliesOnReconnect)
+            ApplyApnProfileToDhcpClients(row);
+    }
+
+    /// <summary>
+    /// RouterOS 7 with a HiLink (ECM) stick: the LTE interface gets a dynamic DHCP client that takes its route and DNS
+    /// settings from the interface's APN profile and blocks any other DHCP client on lte1.
+    /// </summary>
+    public void AddRouterOsLteDhcpClient(string lte = "lte1")
+    {
+        lock (_sync)
+        {
+            var profileName = Tables["/interface/lte"].First(r => r["name"] == lte)["apn-profiles"].Split(',')[0];
+            var profile = Tables["/interface/lte/apn"].First(r => r["name"] == profileName);
+            profile.TryAdd("add-default-route", "yes");
+            profile.TryAdd("default-route-distance", "2");
+            profile.TryAdd("use-peer-dns", "yes");
+            AddRow("/ip/dhcp-client", new()
+            {
+                ["interface"] = lte, ["dynamic"] = "true", ["disabled"] = "false", ["status"] = "bound", ["address"] = "192.168.8.100/24", ["gateway"] = "192.168.8.1",
+            });
+            ApplyApnProfileToDhcpClients(profile);
+        }
+    }
+
+    private void ApplyApnProfileToDhcpClients(Dictionary<string, string> profile)
+    {
+        foreach (var modem in Tables["/interface/lte"].Where(m => m.GetValueOrDefault("apn-profiles")?.Split(',')[0] == profile["name"]))
+        {
+            foreach (var client in Tables["/ip/dhcp-client"].Where(c => c.GetValueOrDefault("interface") == modem["name"] && c.GetValueOrDefault("dynamic") == "true"))
+            {
+                foreach (var key in new[] { "add-default-route", "default-route-distance", "use-peer-dns" })
+                {
+                    if (profile.TryGetValue(key, out var value))
+                        client[key] = value;
+                }
+            }
+        }
     }
 
     private void Remove(string menu, Dictionary<string, string> attributes)
